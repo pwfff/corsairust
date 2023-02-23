@@ -1,3 +1,0 @@
-[submodule "host/rust/include/OpenRGB"]
-	path = host/rust/include/OpenRGB
-	url = https://gitlab.com/CalcProgrammer1/OpenRGB.git
