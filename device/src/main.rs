@@ -1,0 +1,247 @@
+//! Blinks the LED on a Pico board
+//!
+//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+#![no_std]
+#![no_main]
+
+// Provide an alias for our BSP so we can switch targets quickly.
+// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
+use rp_pico as bsp;
+
+use bsp::{entry, XOSC_CRYSTAL_FREQ};
+use defmt::*;
+use defmt_rtt as _;
+use embedded_hal::digital::v2::OutputPin;
+use panic_probe as _;
+
+use bsp::hal::{
+    clocks::{init_clocks_and_plls, Clock},
+    pac, prelude,
+    sio::Sio,
+    usb,
+    watchdog::Watchdog,
+};
+use pac::interrupt;
+
+// USB Device support
+use usb_device::{class_prelude::*, prelude::*};
+
+// USB Human Interface Device (HID) Class support
+use usbd_hid::descriptor::generator_prelude::*;
+use usbd_hid::hid_class::HIDClass;
+
+/// The USB Device Driver (shared with the interrupt).
+static mut USB_DEVICE: Option<UsbDevice<usb::UsbBus>> = None;
+
+/// The USB Bus Driver (shared with the interrupt).
+static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
+
+/// The USB Human Interface Device Driver (shared with the interrupt).
+static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
+
+// for debugging i guess
+extern crate ssmarshal;
+use ssmarshal::serialize;
+
+#[gen_hid_descriptor(
+     (collection = APPLICATION, usage_page = 0xFF69, usage = 0x0200) = {
+         (usage = 0x01,) = {
+            input_buffer=input;
+         };
+         (usage = 0x02,) = {
+            output_buffer=output;
+         };
+     }
+ )]
+struct CustomBidirectionalReport {
+    input_buffer: [u8; 32],
+    output_buffer: [u8; 32],
+}
+
+#[entry]
+fn main() -> ! {
+    info!("Program start");
+    let mut pac = pac::Peripherals::take().unwrap();
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+    let sio = Sio::new(pac.SIO);
+
+    // External high-speed crystal on the pico board is 12Mhz
+    let external_xtal_freq_hz = XOSC_CRYSTAL_FREQ;
+    let clocks = init_clocks_and_plls(
+        external_xtal_freq_hz,
+        pac.XOSC,
+        pac.CLOCKS,
+        pac.PLL_SYS,
+        pac.PLL_USB,
+        &mut pac.RESETS,
+        &mut watchdog,
+    )
+    .ok()
+    .unwrap();
+
+    let pins = bsp::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
+    // Set up the USB driver
+    let usb_bus = UsbBusAllocator::new(usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+    unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_BUS = Some(usb_bus);
+    }
+
+    // Grab a reference to the USB Bus allocator. We are promising to the
+    // compiler not to take mutable access to this global variable whilst this
+    // reference exists!
+    let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
+
+    // Set up the USB HID Class Device driver
+    let usb_hid = HIDClass::new(bus_ref, CustomBidirectionalReport::desc(), 255);
+    unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet.
+        USB_HID = Some(usb_hid);
+    }
+
+    // Create a USB device with a SRGBMods VID and PID
+    let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16d0, 0x1124))
+        .manufacturer("Fake company")
+        .product("RPRGB")
+        .serial_number("TEST")
+        .device_class(0)
+        .build();
+    unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_DEVICE = Some(usb_dev);
+    }
+
+    unsafe {
+        // Enable the USB interrupt
+        pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
+    };
+    let core = pac::CorePeripherals::take().unwrap();
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+
+    let mut led_pin = pins.led.into_push_pull_output();
+
+    info!("up");
+
+    let rep = CustomBidirectionalReport {
+        input_buffer: [0u8; 32],
+        output_buffer: [0u8; 32],
+    };
+    let mut buf = [1u8; 256];
+    match serialize(&mut buf, &rep) {
+        Ok(r) => {
+            info!("{:?}", r);
+            info!("{:X}", buf);
+        }
+        Err(_) => {
+            error!("could not serialize")
+        }
+    }
+
+    loop {
+        // info!("on!");
+        led_pin.set_high().unwrap();
+        delay.delay_ms(500);
+        // info!("off!");
+        led_pin.set_low().unwrap();
+        delay.delay_ms(500);
+    }
+}
+
+static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
+
+/// This function is called whenever the USB Hardware generates an Interrupt
+/// Request.
+#[allow(non_snake_case)]
+#[interrupt]
+unsafe fn USBCTRL_IRQ() {
+    // Handle USB request
+    let usb_dev = USB_DEVICE.as_mut().unwrap();
+    let usb_hid = USB_HID.as_mut().unwrap();
+    if !usb_dev.poll(&mut [usb_hid]) {
+        let newState = usb_dev.state();
+        if newState != LAST_STATE {
+            LAST_STATE = newState;
+            match newState {
+                UsbDeviceState::Default => info!("usb state: default"),
+                UsbDeviceState::Addressed => info!("usb state: addressed"),
+                UsbDeviceState::Configured => info!("usb state: configured"),
+                UsbDeviceState::Suspend => info!("usb state: suspended"),
+            }
+        }
+
+        let mut data = [0u8; 128];
+        match usb_hid.pull_raw_output(&mut data) {
+            Ok(i) => {
+                info!("raw output size {:X}", i);
+                info!("{:X}", data);
+            }
+            Err(err) => handleUSBError(err),
+        }
+        match usb_hid.pull_raw_report(&mut data[..]) {
+            Ok(info) => {
+                info!("report ID {:X}", info.report_id);
+                info!("report ID {:?}", info.report_type as u8);
+                info!("{:X}", data);
+            }
+
+            Err(err) => handleUSBError(err),
+        };
+        return;
+    }
+
+    // info!("poll returned true")
+}
+
+fn handleUSBError(err: usb_device::UsbError) {
+    match err {
+        usb_device::UsbError::WouldBlock => {}
+
+        usb_device::UsbError::ParseError => {
+            error!(" // Parsing failed due to invalid input.  ")
+        }
+
+        usb_device::UsbError::BufferOverflow => {
+            error!(" // A buffer too short for the data to read was passed, or provided data cannot fit within
+            // length constraints.  ")
+        }
+
+        usb_device::UsbError::EndpointOverflow => {
+            error!(
+                " // Classes attempted to allocate more endpoints than the peripheral supports.  "
+            )
+        }
+
+        usb_device::UsbError::EndpointMemoryOverflow => {
+            error!(" // Classes attempted to allocate more packet buffer memory than the peripheral supports. This
+            // can be caused by either a single class trying to allocate a packet buffer larger than the
+            // peripheral supports per endpoint, or multiple allocated endpoints together using more memory
+            // than the peripheral has available for the buffers.  ")
+        }
+
+        usb_device::UsbError::InvalidEndpoint => {
+            error!(" // The endpoint address is invalid or already used.  ")
+        }
+
+        usb_device::UsbError::Unsupported => {
+            error!(" // Operation is not supported by device or configuration.  ")
+        }
+
+        usb_device::UsbError::InvalidState => {
+            error!(" // Operation is not valid in the current state of the object.  ")
+        }
+    }
+}
+
+// End of file

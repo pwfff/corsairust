@@ -1,0 +1,9 @@
+.*/*
+**/target/
+Cargo.lock
+**/build*/
+cargo/*
+**/mdbook/*
+**/mdbook-linkcheck/*
+pip3/*
+rustup/*
