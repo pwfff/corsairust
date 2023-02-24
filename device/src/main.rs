@@ -12,6 +12,9 @@ use bsp::{entry, XOSC_CRYSTAL_FREQ};
 use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::timer::CountDown;
+use fugit::ExtU32;
+
 use panic_probe as _;
 
 use bsp::hal::{
@@ -20,6 +23,7 @@ use bsp::hal::{
     sio::Sio,
     usb,
     watchdog::Watchdog,
+    Timer,
 };
 use pac::interrupt;
 
@@ -38,10 +42,6 @@ static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
 
 /// The USB Human Interface Device Driver (shared with the interrupt).
 static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
-
-// for debugging i guess
-extern crate ssmarshal;
-use ssmarshal::serialize;
 
 #[gen_hid_descriptor(
      (collection = APPLICATION, usage_page = 0xFF69, usage = 0x0200) = {
@@ -127,36 +127,59 @@ fn main() -> ! {
         // Enable the USB interrupt
         pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
     };
-    let core = pac::CorePeripherals::take().unwrap();
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    // let core = pac::CorePeripherals::take().unwrap();
+    // let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     let mut led_pin = pins.led.into_push_pull_output();
 
     info!("up");
 
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut count_down = timer.count_down();
+    let led_on = true;
+    // Create a count_down timer for 500 milliseconds
+    count_down.start(500.millis());
+    loop {
+        poll_usb();
+
+        if count_down.wait().is_ok() {
+            if led_on {
+                led_pin.set_low().unwrap();
+            } else {
+                led_pin.set_high().unwrap();
+            }
+            count_down.start(500.millis());
+        }
+    }
+}
+
+fn poll_usb() {
     let rep = CustomBidirectionalReport {
         input_buffer: [0u8; 32],
         output_buffer: [0u8; 32],
     };
-    let mut buf = [1u8; 256];
-    match serialize(&mut buf, &rep) {
-        Ok(r) => {
-            info!("{:?}", r);
-            info!("{:X}", buf);
-        }
-        Err(_) => {
-            error!("could not serialize")
-        }
-    }
+    // let mut buf = [1u8; 33];
+    // match serialize(&mut buf, &rep) {
+    //     Ok(r) => {
+    //         info!("{:?}", r);
+    //         info!("{:X}", buf);
+    //     }
+    //     Err(_) => {
+    //         error!("could not serialize")
+    //     }
+    // }
 
-    loop {
-        // info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        // info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
-    }
+    critical_section::with(|_| unsafe {
+        USB_HID
+            .as_mut()
+            .map(|usb_hid| match usb_hid.push_input(&rep) {
+                Ok(i) => {
+                    // info!("sent {} bytes", i)
+                }
+
+                Err(e) => handle_usberror(e),
+            });
+    })
 }
 
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
@@ -169,42 +192,42 @@ unsafe fn USBCTRL_IRQ() {
     // Handle USB request
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_hid = USB_HID.as_mut().unwrap();
-    if !usb_dev.poll(&mut [usb_hid]) {
-        let newState = usb_dev.state();
-        if newState != LAST_STATE {
-            LAST_STATE = newState;
-            match newState {
-                UsbDeviceState::Default => info!("usb state: default"),
-                UsbDeviceState::Addressed => info!("usb state: addressed"),
-                UsbDeviceState::Configured => info!("usb state: configured"),
-                UsbDeviceState::Suspend => info!("usb state: suspended"),
-            }
-        }
-
-        let mut data = [0u8; 128];
+    if usb_dev.poll(&mut [usb_hid]) {
+        let mut data = [0u8; 64];
         match usb_hid.pull_raw_output(&mut data) {
             Ok(i) => {
-                info!("raw output size {:X}", i);
-                info!("{:X}", data);
+                info!("raw output size {}", i);
+                info!("{:X}", data[0..i]);
             }
-            Err(err) => handleUSBError(err),
+            Err(err) => handle_usberror(err),
         }
-        match usb_hid.pull_raw_report(&mut data[..]) {
-            Ok(info) => {
-                info!("report ID {:X}", info.report_id);
-                info!("report ID {:?}", info.report_type as u8);
-                info!("{:X}", data);
-            }
+        // match usb_hid.pull_raw_report(&mut data[..]) {
+        //     Ok(info) => {
+        //         info!("report ID {:X}", info.report_id);
+        //         info!("report ID {:?}", info.report_type as u8);
+        //         info!("{:X}", data);
+        //     }
 
-            Err(err) => handleUSBError(err),
-        };
-        return;
+        //     Err(err) => handle_usberror(err),
+        // };
+        // info!("poll returned true")
+    } else {
+        // info!("poll returned false")
     }
 
-    // info!("poll returned true")
+    let newState = usb_dev.state();
+    if newState != LAST_STATE {
+        LAST_STATE = newState;
+        match newState {
+            UsbDeviceState::Default => info!("usb state: default"),
+            UsbDeviceState::Addressed => info!("usb state: addressed"),
+            UsbDeviceState::Configured => info!("usb state: configured"),
+            UsbDeviceState::Suspend => info!("usb state: suspended"),
+        }
+    }
 }
 
-fn handleUSBError(err: usb_device::UsbError) {
+fn handle_usberror(err: usb_device::UsbError) {
     match err {
         usb_device::UsbError::WouldBlock => {}
 
