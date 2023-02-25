@@ -13,7 +13,7 @@ defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 # We're using a Pico by default on this template
-rp-pico = "0.6"
+rp-pico = "0.7.0"
 usb-device = "0.2.9"
 usbd-hid = "0.6.1"
 critical-section = "1.1.1"

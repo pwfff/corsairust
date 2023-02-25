@@ -135,20 +135,27 @@ fn main() -> ! {
     info!("up");
 
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    let mut count_down = timer.count_down();
-    let led_on = true;
+    let mut poll_count_down = timer.count_down();
+    let mut led_count_down = timer.count_down();
+    let mut led_on = true;
     // Create a count_down timer for 500 milliseconds
-    count_down.start(500.millis());
+    led_count_down.start(500.millis());
+    poll_count_down.start(200.millis());
     loop {
-        poll_usb();
+        if poll_count_down.wait().is_ok() {
+            poll_usb();
+            poll_count_down.start(200.millis());
+        };
 
-        if count_down.wait().is_ok() {
+        if led_count_down.wait().is_ok() {
             if led_on {
                 led_pin.set_low().unwrap();
+                led_on = false;
             } else {
                 led_pin.set_high().unwrap();
+                led_on = true;
             }
-            count_down.start(500.millis());
+            led_count_down.start(500.millis());
         }
     }
 }
@@ -193,7 +200,7 @@ unsafe fn USBCTRL_IRQ() {
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_hid = USB_HID.as_mut().unwrap();
     if usb_dev.poll(&mut [usb_hid]) {
-        let mut data = [0u8; 64];
+        let mut data = [0u8; 32];
         match usb_hid.pull_raw_output(&mut data) {
             Ok(i) => {
                 info!("raw output size {}", i);
