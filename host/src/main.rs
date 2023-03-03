@@ -1,21 +1,31 @@
 extern crate hidapi;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use hidapi::DeviceInfo;
+use openrgb::protocol::RGBControllerInterface;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let api = hidapi::HidApi::new().unwrap();
     // Print out information about all connected devices
-    for device in api.device_list() {
-        println!("{:#?}", device);
-    }
-
     loop {
+        // Connect to device using its VID and PID
         let (VID, PID) = (0x16d0, 0x1124);
-        let device = api.open(VID, PID).unwrap();
+        match api.open(VID, PID) {
+            Ok(device) => match poll(&device) {
+                Ok(_) => {}
+                Err(e) => println!("err polling: {}", e),
+            },
+            Err(e) => println!("err connecting: {}", e),
+        }
+        std::thread::sleep(Duration::from_millis(100))
+    }
+}
 
+fn poll(device: &hidapi::HidDevice) -> hidapi::HidResult<usize> {
+    loop {
         // Read data from device
         let mut buf = [0u8; 33];
-        let res = device.read(&mut buf[..]).unwrap();
+        let res = device.read(&mut buf[..])?;
         println!("Read: {:?}", &buf[..res]);
 
         // Write data to device
@@ -28,8 +38,12 @@ fn main() {
                 .to_be_bytes()
                 .as_slice(),
         );
-        let res = device.write(&buf).unwrap();
+        let res = device.write(&buf)?;
+        // device.send_feature_report(data)
         println!("Wrote: {:?} byte(s)", res);
     }
-    // Connect to device using its VID and PID
 }
+
+struct TinyController {}
+
+// impl RGBControllerInterface for TinyController {}

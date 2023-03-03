@@ -107,6 +107,7 @@ dependencies = [
  "embedded-hal",
  "embedded-time",
  "fugit",
+ "hid",
  "panic-probe",
  "rp-pico",
  "serde",
@@ -120,6 +121,7 @@ name = "corsairust-host"
 version = "0.1.0"
 dependencies = [
  "hidapi",
+ "openrgb",
 ]
 
 [[package]]
@@ -274,6 +276,13 @@ name = "glob"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
+
+[[package]]
+name = "hid"
+version = "0.1.0"
+dependencies = [
+ "usbd-hid",
+]
 
 [[package]]
 name = "hidapi"

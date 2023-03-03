@@ -4,6 +4,8 @@ name = "corsairust-device"
 version = "0.1.0"
 
 [dependencies]
+hid = { path = "../hid" }
+
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }

@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+use hid::CustomBidirectionalReport;
+
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
@@ -31,8 +33,7 @@ use pac::interrupt;
 use usb_device::{class_prelude::*, prelude::*};
 
 // USB Human Interface Device (HID) Class support
-use usbd_hid::descriptor::generator_prelude::*;
-use usbd_hid::hid_class::HIDClass;
+use usbd_hid::{descriptor::SerializedDescriptor, hid_class::HIDClass};
 
 /// The USB Device Driver (shared with the interrupt).
 static mut USB_DEVICE: Option<UsbDevice<usb::UsbBus>> = None;
@@ -43,20 +44,8 @@ static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
 /// The USB Human Interface Device Driver (shared with the interrupt).
 static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
 
-#[gen_hid_descriptor(
-     (collection = APPLICATION, usage_page = 0xFF69, usage = 0x0200) = {
-         (usage = 0x01,) = {
-            input_buffer=input;
-         };
-         (usage = 0x02,) = {
-            output_buffer=output;
-         };
-     }
- )]
-struct CustomBidirectionalReport {
-    input_buffer: [u8; 32],
-    output_buffer: [u8; 32],
-}
+const USB_POLL_RATE_MILLIS: u32 = 100;
+const LED_BLINK_RATE_MILLIS: u32 = 500;
 
 #[entry]
 fn main() -> ! {
@@ -139,12 +128,12 @@ fn main() -> ! {
     let mut led_count_down = timer.count_down();
     let mut led_on = true;
     // Create a count_down timer for 500 milliseconds
-    led_count_down.start(500.millis());
-    poll_count_down.start(200.millis());
+    led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
+    poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
     loop {
         if poll_count_down.wait().is_ok() {
             poll_usb();
-            poll_count_down.start(200.millis());
+            poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
         };
 
         if led_count_down.wait().is_ok() {
@@ -155,7 +144,7 @@ fn main() -> ! {
                 led_pin.set_high().unwrap();
                 led_on = true;
             }
-            led_count_down.start(500.millis());
+            led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
         }
     }
 }

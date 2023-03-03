@@ -3,6 +3,7 @@ members = [
     "device",
     "host",
     "openrgb",
+    "hid",
 ]
 
 # cargo build/run
