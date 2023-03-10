@@ -3,10 +3,12 @@
 //! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
+mod messaging;
+
+use crate::messaging::packets::*;
+use messaging::wrapper::{self, MAX_BUFFER_SIZE, MAX_MESSAGE_SIZE};
 
 use hid::*;
-mod srgb;
-use srgb::packets::wrapper;
 
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
@@ -183,49 +185,8 @@ fn poll_usb() {
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 
 // buffer guaranteed to hold max message size
-static mut message_buffer: [u8; 255 * 26] = [0u8; 255 * 26];
-static mut wrapper_buffer: [u8; 32] = [0u8; 32];
-
-unsafe fn process_message(data: &[u8; 32]) -> Result<Option<u32>, &'static str> {
-    let message = wrapper::View::new(data);
-    // first message, clear message_buffer and start from the top
-    if message.message_num().read() == 0 {
-        debug!("processing first message in group");
-        wrapper_buffer.copy_from_slice(data);
-        message_buffer.fill(0);
-        message_buffer[0..26].copy_from_slice(message.message());
-        if message.message_count().read() == 1 {
-            return Ok(Some(message.packet_id().read()));
-        }
-        return Ok(None);
-    }
-
-    debug!("processing later message in group");
-
-    // not the first message, try to keep appending to message_buffer
-    let old_message = wrapper::View::new(wrapper_buffer);
-    let id = message.packet_id().read();
-    let old_id = old_message.packet_id().read();
-    if id != old_id {
-        return Err("unexpected message ID");
-    }
-
-    if message.message_count().read() != old_message.message_count().read() {
-        return Err("message count changed unexpectedly");
-    }
-
-    if message.message_num().read() != old_message.message_num().read() + 1 {
-        return Err("message out of order");
-    }
-
-    let i: usize = message.message_num().read().into();
-    wrapper_buffer.copy_from_slice(data);
-    message_buffer[i * 26..(i + 1) * 26].copy_from_slice(message.message());
-    if message.message_num().read() + 1 == message.message_count().read() {
-        return Ok(Some(message.packet_id().read()));
-    }
-    return Ok(None);
-}
+static mut message_buffer: [u8; MAX_MESSAGE_SIZE] = [0u8; MAX_MESSAGE_SIZE];
+static mut wrapper_buffer: [u8; MAX_BUFFER_SIZE] = [0u8; MAX_BUFFER_SIZE];
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.
@@ -236,39 +197,7 @@ unsafe fn USBCTRL_IRQ() {
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_hid = USB_HID.as_mut().unwrap();
     if usb_dev.poll(&mut [usb_hid]) {
-        let mut data = [0u8; 32];
-        match usb_hid.pull_raw_output(&mut data) {
-            Ok(i) => {
-                info!("raw output size {}", i);
-                info!("{:X}", data[0..i]);
-                match process_message(&data) {
-                    Ok(r) => match r {
-                        Some(id) => match id {
-                            0 => {
-                                // this is hardcoded 'request controller count', respond with 69
-                                let mut rep = CustomBidirectionalReport {
-                                    input_buffer: [0u8; 32],
-                                    output_buffer: [0u8; 32],
-                                };
-                                rep.input_buffer[6] = 69;
-                                match usb_hid.push_input(&rep) {
-                                    Ok(i) => {
-                                        info!("sent {} bytes", i)
-                                    }
-
-                                    Err(e) => handle_usberror(e),
-                                };
-                            }
-                            _ => warn!("unknown packet ID {}", id),
-                        },
-
-                        None => {}
-                    },
-                    Err(e) => error!("error processing message: {}", e),
-                };
-            }
-            Err(err) => handle_usberror(err),
-        }
+        let message = wrapper::read_all(usb_hid);
         // let rep = SetLEDsReport {
         //     zone_id: 0,
         //     led_count: 0,
