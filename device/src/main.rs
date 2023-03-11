@@ -187,6 +187,7 @@ static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 // buffer guaranteed to hold max message size
 static mut message_buffer: [u8; MAX_MESSAGE_SIZE] = [0u8; MAX_MESSAGE_SIZE];
 static mut wrapper_buffer: [u8; MAX_BUFFER_SIZE] = [0u8; MAX_BUFFER_SIZE];
+static mut CONTROLLER: Option<Controller> = None;
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.
@@ -197,7 +198,19 @@ unsafe fn USBCTRL_IRQ() {
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_hid = USB_HID.as_mut().unwrap();
     if usb_dev.poll(&mut [usb_hid]) {
-        let message = wrapper::read_all(usb_hid);
+        let r = wrapper::read_all(usb_hid);
+        match r {
+            Ok(mut data) => {
+                let controller = CONTROLLER.as_mut().unwrap();
+                match controller.handle(&mut data) {
+                    Ok(response) => {
+                        // wrapper::write_all(usb_hid, response);
+                    }
+                    Err(e) => error!("{}", e),
+                };
+            }
+            Err(e) => handle_usberror(e),
+        }
         // let rep = SetLEDsReport {
         //     zone_id: 0,
         //     led_count: 0,
