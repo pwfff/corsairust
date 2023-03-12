@@ -189,9 +189,6 @@ fn poll_usb() {
 
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 
-// buffer guaranteed to hold max message size
-static mut message_buffer: [u8; MAX_MESSAGE_SIZE] = [0u8; MAX_MESSAGE_SIZE];
-static mut wrapper_buffer: [u8; MAX_BUFFER_SIZE] = [0u8; MAX_BUFFER_SIZE];
 static mut CONTROLLER: Option<Controller> = None;
 
 /// This function is called whenever the USB Hardware generates an Interrupt

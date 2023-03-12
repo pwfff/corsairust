@@ -1,4 +1,5 @@
 use arrayref::array_ref;
+use postcard::fixint::*;
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::MAX_MESSAGE_SIZE;
@@ -34,10 +35,8 @@ pub struct RequestControllerCount {}
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct RequestControllerCountResponse {
-    #[serde(with = "postcard::fixint::le")]
-    packet_id: u32,
-    #[serde(with = "postcard::fixint::le")]
-    controller_count: u32,
+    packet_id: LE<u32>,
+    controller_count: LE<u32>,
 }
 
 impl Handler<RequestControllerCountResponse> for RequestControllerCount {
@@ -48,8 +47,8 @@ impl Handler<RequestControllerCountResponse> for RequestControllerCount {
 
     fn handle(&self, controller: &Controller) -> RequestControllerCountResponse {
         RequestControllerCountResponse {
-            packet_id: 0,
-            controller_count: controller.controller_count(),
+            packet_id: 0.into(),
+            controller_count: controller.controller_count().into(),
         }
     }
 }
