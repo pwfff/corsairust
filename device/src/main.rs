@@ -116,6 +116,11 @@ fn main() -> ! {
         USB_DEVICE = Some(usb_dev);
     }
 
+    let controller = Controller {};
+    unsafe {
+        CONTROLLER = Some(controller);
+    }
+
     unsafe {
         // Enable the USB interrupt
         pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
@@ -204,7 +209,7 @@ unsafe fn USBCTRL_IRQ() {
                 let controller = CONTROLLER.as_mut().unwrap();
                 match controller.handle(&mut data) {
                     Ok(response) => {
-                        // wrapper::write_all(usb_hid, response);
+                        wrapper::write_all(usb_hid, response).map_err(handle_usberror);
                     }
                     Err(e) => error!("{}", e),
                 };

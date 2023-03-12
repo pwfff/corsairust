@@ -15,7 +15,7 @@ impl Controller {
 
         let r = p.handle(self);
 
-        postcard::to_slice_cobs(&r, data).map_err(|e| Error::PostcardError(e))
+        postcard::to_slice(&r, data).map_err(|e| Error::PostcardError(e))
     }
 
     fn controller_count(&self) -> u32 {
@@ -34,6 +34,9 @@ pub struct RequestControllerCount {}
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct RequestControllerCountResponse {
+    #[serde(with = "postcard::fixint::le")]
+    packet_id: u32,
+    #[serde(with = "postcard::fixint::le")]
     controller_count: u32,
 }
 
@@ -45,6 +48,7 @@ impl Handler<RequestControllerCountResponse> for RequestControllerCount {
 
     fn handle(&self, controller: &Controller) -> RequestControllerCountResponse {
         RequestControllerCountResponse {
+            packet_id: 0,
             controller_count: controller.controller_count(),
         }
     }
