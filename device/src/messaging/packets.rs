@@ -1,5 +1,5 @@
 use arrayref::array_ref;
-use postcard::fixint::*;
+use corsairust_macros::all_fields_with;
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::MAX_MESSAGE_SIZE;
@@ -33,10 +33,11 @@ pub trait Handler<R: Serialize> {
 
 pub struct RequestControllerCount {}
 
+#[all_fields_with("postcard::fixint::le")]
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct RequestControllerCountResponse {
-    packet_id: LE<u32>,
-    controller_count: LE<u32>,
+    packet_id: u32,
+    controller_count: u32,
 }
 
 impl Handler<RequestControllerCountResponse> for RequestControllerCount {
@@ -47,8 +48,8 @@ impl Handler<RequestControllerCountResponse> for RequestControllerCount {
 
     fn handle(&self, controller: &Controller) -> RequestControllerCountResponse {
         RequestControllerCountResponse {
-            packet_id: 0.into(),
-            controller_count: controller.controller_count().into(),
+            packet_id: 0,
+            controller_count: controller.controller_count(),
         }
     }
 }

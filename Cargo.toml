@@ -4,6 +4,7 @@ members = [
     "host",
     "openrgb",
     "hid",
+    "macros",
 ]
 
 # cargo build/run
