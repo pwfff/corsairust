@@ -29,7 +29,6 @@ cobs = { version = "0.2.3", default-features = false }
 [dependencies.postcard]
 version = "1.0.4"
 features = ["use-defmt"]
-path = "/home/pwf/src/postcard"
 
 [dependencies.serde]
 version = "1.0"
