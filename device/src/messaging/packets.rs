@@ -1,17 +1,20 @@
-use arrayref::array_ref;
 use corsairust_macros::all_fields_with;
+use openrgb_data::{OpenRGBReadableSync, PacketId};
 use serde::{Deserialize, Serialize};
 
 use super::wrapper::MAX_MESSAGE_SIZE;
 use super::{Error, Result};
 
+pub static DEFAULT_PROTOCOL: u32 = 3;
+
 pub struct Controller {}
 impl Controller {
     pub fn handle<'a>(&self, data: &'a mut [u8; MAX_MESSAGE_SIZE]) -> Result<&'a mut [u8]> {
-        let packet_id = u32::from_le_bytes(*array_ref!(data, 0, 4));
-        let p = match packet_id {
-            0 => Ok(RequestControllerCount::new(data)),
-            i => Err(Error::UnknownPacket(i)),
+        let h = OpenRGBReadableSync::read_any(&mut data.as_slice(), DEFAULT_PROTOCOL)
+            .map_err(|e| Error::Oops("()"))?;
+        let p = match h.packet_id {
+            PacketId::RequestControllerCount => Ok(RequestControllerCount::new(data)),
+            i => Err(Error::UnknownPacket(9999)),
         }?;
 
         let r = p.handle(self);

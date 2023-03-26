@@ -25,6 +25,13 @@ fugit = "0.3.6"
 binary-layout = { version = "3.1.3", default-features = false }
 arrayref = "0.3.6"
 cobs = { version = "0.2.3", default-features = false }
+openrgb-data = { path = "/home/pwf/src/openrgb-rs/data", default-features = false }
+byteorder = { version = "1.4.3", default-features = false }
+embedded-alloc = "0.5.0"
+
+[dependencies.genio]
+git = "https://github.com/Kixunil/genio"
+default-features = false
 
 [dependencies.postcard]
 version = "1.0.4"

@@ -5,6 +5,11 @@
 #![no_main]
 mod messaging;
 
+use embedded_alloc::Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
 use crate::messaging::packets::*;
 use messaging::wrapper::{self, MAX_BUFFER_SIZE, MAX_MESSAGE_SIZE};
 

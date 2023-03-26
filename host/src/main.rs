@@ -2,55 +2,38 @@
 extern crate error_chain;
 extern crate hidapi;
 
-use enum_dispatch::enum_dispatch;
+use error_chain::ChainedError;
 use futures::executor::block_on;
-use genio::Write;
-use hidapi::{DeviceInfo, HidDevice};
+use hidapi::HidDevice;
 use openrgb::DEFAULT_PROTOCOL;
 use openrgb_data::{
     Controller, Header, OpenRGBError, OpenRGBReadable, OpenRGBReadableSync, OpenRGBSync,
     OpenRGBWritable, OpenRGBWritableSync, PacketId,
 };
-use std::{
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::pin::Pin;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    spawn,
-    sync::Mutex,
+    select,
+    time::{sleep, Duration},
 };
 
 mod errors {
-    use genio::error::ReadExactError;
+    use genio::error::BufferOverflow;
     use openrgb_data::OpenRGBError;
 
     // Create the Error, ErrorKind, ResultExt, and Result types
-    error_chain! {}
+    error_chain! {
+            foreign_links {
+                Fmt(::std::fmt::Error);
+                Io(::std::io::Error);
+                Hid(::hidapi::HidError);
+            }
+    }
 
     impl From<OpenRGBError> for Error {
         fn from(s: OpenRGBError) -> Self {
-            ErrorKind::Msg(format!("{:?}", s)).into()
-        }
-    }
-
-    impl<T> From<ReadExactError<T>> for Error {
-        fn from(s: ReadExactError<T>) -> Self {
-            s.into()
-        }
-    }
-
-    impl From<std::io::Error> for Error {
-        fn from(s: std::io::Error) -> Self {
-            s.into()
-        }
-    }
-
-    impl From<hidapi::HidError> for Error {
-        fn from(s: hidapi::HidError) -> Self {
-            s.into()
+            format!("{:?}", s).into()
         }
     }
 }
@@ -64,105 +47,87 @@ async fn main() -> io::Result<()> {
 
     let api = hidapi::HidApi::new().unwrap();
 
-    let dev = connect(&api, VID, PID);
-    let d = Arc::new(Mutex::new(dev));
+    let w = DevWriter {
+        api,
+        address: (VID, PID),
+    };
 
-    let s = Foo { device: d.clone() };
+    // spawn(s.serve());
 
-    spawn(s.serve());
+    let s = TcpListener::bind("127.0.0.1:6742").await?;
+
+    println!("listening on 6742");
 
     loop {
-        match api.open(VID, PID) {
-            Ok(device) => match poll(&device) {
-                Ok(_) => {
-                    let mut f = d.lock().await;
-                    *f = device;
+        select! {
+            Ok((socket, _)) = s.accept() => {
+                let mut reader = Blocker {
+                    s: Box::pin(socket),
+                };
+                match handle(&w, &mut reader).await {
+                    Ok(_) => println!("handled a packet bruv"),
+                    Err(e) => println!("error handling packet: {}", e.display_chain().to_string()),
+                };
+            }
+
+            _ = sleep(Duration::from_millis(100)) => {
+                match w.read() {
+                    Ok((s, b)) => {
+                        if s > 0 {
+                            println!("unexpected input from device: {b:X?}");
+                        }
+                    }
+                    Err(e) => {
+                        println!("{e:?}")
+                    }
                 }
-                Err(e) => println!("err polling: {}", e),
-            },
-            Err(e) => println!("err connecting: {}", e),
-        }
-        std::thread::sleep(Duration::from_millis(100))
-    }
-}
-
-fn connect(api: &hidapi::HidApi, VID: u16, PID: u16) -> hidapi::HidDevice {
-    loop {
-        match api.open(VID, PID) {
-            Ok(device) => return device,
-            Err(e) => println!("err connecting: {}", e),
-        }
-        std::thread::sleep(Duration::from_millis(1000))
-    }
-}
-
-struct Foo {
-    device: Arc<Mutex<HidDevice>>,
-}
-
-impl Foo {
-    async fn handle(&mut self, s: &mut Blocker) -> Result<()> {
-        let header = s
-            .read_any(DEFAULT_PROTOCOL)
-            .map_err(|e| format!("{:?}", e))?;
-
-        let mut buf = Vec::<u8>::with_capacity(header.len as usize);
-        s.read_exact(&mut buf).await?;
-
-        let mut packet: Vec<u8> = Vec::new();
-        packet.write_value(header, DEFAULT_PROTOCOL)?;
-        packet.write(&mut buf, DEFAULT_PROTOCOL)?;
-        // genio::Write::write_all(&mut packet, &buf)?;
-
-        self.device.lock().await.write(&mut buf)?;
-
-        Ok(())
-    }
-
-    // async fn new_device(&mut self, d: Box<hidapi::HidDevice>) {
-    //     self.device.lock().await;
-    //     self.device = Arc::new(Mutex::new(*d));
-    // }
-
-    async fn serve(mut self) -> Result<()> {
-        let s = TcpListener::bind("localhost:8123").await?;
-        loop {
-            match s.accept().await {
-                Ok((socket, _)) => {
-                    let mut reader = Blocker {
-                        s: Box::pin(socket),
-                    };
-                    self.handle(&mut reader).await?;
-                }
-                Err(e) => {
-                    println!("{}", e);
-                    // TODO: restart
-                }
-            };
+            }
         }
     }
 }
 
-fn poll(device: &hidapi::HidDevice) -> hidapi::HidResult<usize> {
-    loop {
-        // Read data from device
+async fn handle(dev: &DevWriter, s: &mut Blocker) -> Result<()> {
+    let header = s
+        .read_any(DEFAULT_PROTOCOL)
+        .map_err(|e| format!("{:?}", e))?;
+
+    let mut buf = Vec::<u8>::with_capacity(header.len as usize);
+    s.read_exact(&mut buf).await?;
+
+    let total_len = header.len as usize + header.size(DEFAULT_PROTOCOL);
+    let mut packet: Vec<u8> = Vec::<u8>::with_capacity(total_len);
+    header.write(&mut packet, DEFAULT_PROTOCOL)?;
+    buf.write(&mut packet, DEFAULT_PROTOCOL)?;
+
+    let encoded = cobs::encode_vec(&packet);
+
+    dev.write(&encoded)?;
+
+    Ok(())
+}
+
+struct DevWriter {
+    api: hidapi::HidApi,
+    address: (u16, u16),
+}
+
+impl DevWriter {
+    fn open(&self) -> Result<HidDevice> {
+        self.api
+            .open(self.address.0, self.address.1)
+            .chain_err(|| "could not open device")
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize> {
+        self.open()?
+            .write(&buf)
+            .chain_err(|| "error writing to device")
+    }
+
+    fn read(&self) -> Result<(usize, Box<[u8]>)> {
         let mut buf = [0u8; 64];
-        let res = device.read_timeout(&mut buf[..], 150)?;
-        println!("Read: {:?}", &buf[..res]);
-
-        // Write data to device
-        let mut buf = [0u8; 64];
-        buf[17..33].copy_from_slice(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                .to_be_bytes()
-                .as_slice(),
-        );
-        // let res = device.send_feature_report(&buf)?;
-        let res = device.write(&buf)?;
-        println!("Wrote: {:?} byte(s)", res);
+        let read = self.open()?.read_timeout(&mut buf, 150)?;
+        Ok((read, Box::new(buf)))
     }
 }
 
