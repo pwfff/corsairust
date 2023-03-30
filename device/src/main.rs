@@ -5,6 +5,9 @@
 #![no_main]
 mod messaging;
 
+extern crate alloc;
+
+use alloc::vec::{self, Vec};
 use embedded_alloc::Heap;
 
 #[global_allocator]
@@ -59,6 +62,14 @@ const LED_BLINK_RATE_MILLIS: u32 = 500;
 #[entry]
 fn main() -> ! {
     info!("Program start");
+
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 1024 * 32;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+    }
+    info!("allocator initialized");
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
@@ -207,11 +218,12 @@ unsafe fn USBCTRL_IRQ() {
     if usb_dev.poll(&mut [usb_hid]) {
         let r = wrapper::read_all(usb_hid);
         match r {
-            Ok(mut data) => {
+            Ok(data) => {
                 let controller = CONTROLLER.as_mut().unwrap();
-                match controller.handle(&mut data) {
-                    Ok(response) => {
-                        wrapper::write_all(usb_hid, response).map_err(handle_usberror);
+                let mut resp: Vec<u8> = Vec::with_capacity(MAX_MESSAGE_SIZE);
+                match controller.handle(&data.into(), &mut resp) {
+                    Ok(_) => {
+                        wrapper::write_all(usb_hid, &mut resp).map_err(handle_usberror);
                     }
                     Err(e) => error!("{}", e),
                 };

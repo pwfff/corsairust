@@ -87,23 +87,43 @@ async fn main() -> io::Result<()> {
 }
 
 async fn handle(dev: &DevWriter, s: &mut Blocker) -> Result<()> {
-    let header = s
-        .read_any(DEFAULT_PROTOCOL)
-        .map_err(|e| format!("{:?}", e))?;
+    loop {
+        let header = s
+            .read_any(DEFAULT_PROTOCOL)
+            .map_err(|e| format!("{:?}", e))?;
+        println!("got header {:?}", header);
+        let mut buf = vec![0; header.len as usize];
+        s.read_exact(&mut buf).await?;
+        println!("got rest of packet {:?}", buf);
 
-    let mut buf = Vec::<u8>::with_capacity(header.len as usize);
-    s.read_exact(&mut buf).await?;
+        let total_len = header.len as usize + header.size(DEFAULT_PROTOCOL);
+        let mut packet: Vec<u8> = Vec::<u8>::with_capacity(total_len);
+        header.write(&mut packet, DEFAULT_PROTOCOL)?;
+        buf.write(&mut packet, DEFAULT_PROTOCOL)?;
 
-    let total_len = header.len as usize + header.size(DEFAULT_PROTOCOL);
-    let mut packet: Vec<u8> = Vec::<u8>::with_capacity(total_len);
-    header.write(&mut packet, DEFAULT_PROTOCOL)?;
-    buf.write(&mut packet, DEFAULT_PROTOCOL)?;
+        println!("forwarding {:X?}", packet);
 
-    let encoded = cobs::encode_vec(&packet);
+        let encoded = cobs::encode_vec(&packet);
 
-    dev.write(&encoded)?;
+        dev.write(&encoded)?;
 
-    Ok(())
+        let (got, mut gotted) = dev.read()?;
+        //TODO: don't unwrap or something idk
+        cobs::decode_in_place(gotted.as_mut()).unwrap();
+        println!("{}: {:X?}", got, gotted);
+        // orf orf orf orf
+        // let f = header.size(DEFAULT_PROTOCOL);
+
+        let header = gotted.as_ref().read_any(DEFAULT_PROTOCOL)?;
+        let len = header.len as usize;
+        println!(
+            "forwarding response {}: {:X?} {:X?}",
+            len,
+            header,
+            &gotted[16..16 + len]
+        );
+        s.write_all(&gotted[..16 + len]).await?;
+    }
 }
 
 struct DevWriter {
