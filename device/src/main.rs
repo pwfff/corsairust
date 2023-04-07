@@ -10,10 +10,12 @@ extern crate alloc;
 use alloc::vec::{self, Vec};
 use bsp::hal::dma::{Channel, DMAExt, CH0, CH1};
 use bsp::hal::gpio::bank0::{Gpio0, Gpio1};
+use cortex_m::delay::Delay;
+use cortex_m::prelude::_embedded_hal_blocking_delay_DelayUs;
 use cortex_m::singleton;
 use embedded_alloc::Heap;
 use smart_leds_trait::RGB8;
-use ws2812_pio::{LEDBuf, LEDs, Ws2812Direct};
+use ws2812_pio::{buf, LEDs, Ws2812Direct};
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -105,16 +107,21 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Split the PIO state machine 0 into individual objects, so that
-    // Ws2812 can use it:
+    // split the PIO state machines into individual objects, so that Ws2812 can use them.
+    // each state machine will handle two channels of LEDs
     let (mut pio0, sm0, sm1, sm2, sm3) = pac.PIO0.split(&mut pac.RESETS);
     let (mut pio1, sm4, sm5, sm6, sm7) = pac.PIO1.split(&mut pac.RESETS);
     let dma = pac.DMA.split(&mut pac.RESETS);
 
     // board is driving 16 LED chains, i guess?
     // we have 8 state machines, so two chains per machine
-    let buf0: &'static mut [u32; 128] = singleton!(: [u32; 128] = [0xFFFFFFFF; 128]).unwrap();
-    let buf1: &'static mut [u32; 128] = singleton!(: [u32; 128] = [0xFFFFFFFF; 128]).unwrap();
+    const LEDS_PER_DEVICE: usize = 9;
+    let mut leds: LEDs<LEDS_PER_DEVICE, RGB8> = LEDs {
+        channel0: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
+        channel1: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
+    };
+    let buf0 = buf!(LEDS_PER_DEVICE);
+    let buf1 = buf!(LEDS_PER_DEVICE);
 
     let mut light = Ws2812Direct::new(
         pins.gpio0.into_mode(),
@@ -173,17 +180,17 @@ fn main() -> ! {
         // Enable the USB interrupt
         pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
     };
-    // let core = pac::CorePeripherals::take().unwrap();
-    // let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let core = pac::CorePeripherals::take().unwrap();
+    // todo foo lol i'm tired
+    let mut delay = Foo(cortex_m::delay::Delay::new(
+        core.SYST,
+        clocks.system_clock.freq().to_Hz(),
+    ));
 
     let mut led_pin = pins.led.into_push_pull_output();
 
     info!("up");
 
-    let mut leds: LEDs<64, RGB8> = LEDs {
-        channel0: [RGB8::new(0xFF, 0x00, 0x00); 64],
-        channel1: [RGB8::new(0xFF, 0x00, 0x00); 64],
-    };
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
@@ -198,20 +205,186 @@ fn main() -> ! {
         };
 
         if led_count_down.wait().is_ok() {
+            // info!("buf0 {:X}", buf0);
+            // info!("buf1 {:X}", buf1);
             if led_on {
-                leds.channel1 = [RGB8::new(0x00, 0xFF, 0x00); 64];
                 led_pin.set_low().unwrap();
                 led_on = false;
             } else {
-                leds.channel1 = [RGB8::new(0x00, 0x00, 0xFF); 64];
                 led_pin.set_high().unwrap();
                 led_on = true;
             }
-            light = light.write(&leds);
+            // for v in leds.channel0.iter() {
+            //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
+            // }
             led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
         }
 
+        for v in leds.channel0.iter_mut() {
+            hsv::step_hue(v, 12345)
+        }
+        for v in leds.channel1.iter_mut() {
+            hsv::step_hue(v, 12345)
+        }
+        light = light.write(&mut delay, &leds);
+
         // light = light.pump();
+    }
+}
+
+struct Foo(Delay);
+
+impl ws2812_pio::DelayUs for Foo {
+    fn delay_us(&mut self, us: u32) {
+        self.0.delay_us(us)
+    }
+}
+
+mod hsv {
+    use defmt::info;
+    use smart_leds_trait::RGB8;
+
+    pub fn step_hue(c: &mut RGB8, step: u32) {
+        let (h, s, v) = rgb2hsv(c.r, c.g, c.b);
+
+        let mut new = h + step;
+        if new > MAX_HUE {
+            new = new - MAX_HUE;
+        }
+
+        (c.r, c.g, c.b) = hsv2rgb(new, s, v);
+    }
+
+    // neato: https://www.sciencedirect.com/science/article/abs/pii/S0045790615002827
+    // found implemented here: https://bitbucket.org/chernov/colormath_hsv/src/master/colormath/hsv.cpp
+    const MAX_VALUE: u8 = 0xFF;
+
+    const MAX_SATURATION: u16 = 0xFFFF;
+
+    const HUE_EDGE_LEN: u32 = 65537;
+    const MAX_HUE: u32 = HUE_EDGE_LEN * 6;
+
+    fn rgb2hsv(r: u8, g: u8, b: u8) -> (u32, u16, u8) {
+        let (max, mid, min): (u8, u8, u8);
+        let edge: u32;
+        let inverse: bool;
+
+        if r > g {
+            if g >= b {
+                max = r;
+                mid = g;
+                min = b;
+                edge = 0;
+                inverse = false;
+            } else if r > b {
+                max = r;
+                mid = b;
+                min = g;
+                edge = 5;
+                inverse = true;
+            } else {
+                max = b;
+                mid = r;
+                min = g;
+                edge = 4;
+                inverse = false;
+            }
+        } else if r > b {
+            max = g;
+            mid = r;
+            min = b;
+            edge = 1;
+            inverse = true;
+        } else {
+            if g > b {
+                max = g;
+                mid = b;
+                min = r;
+                edge = 2;
+                inverse = false;
+            } else {
+                max = b;
+                mid = g;
+                min = r;
+                edge = 3;
+                inverse = true;
+            }
+        }
+
+        let v = max;
+
+        let delta: u32 = (max - min) as u32;
+        if delta == 0 {
+            return (0, 0, v);
+        }
+
+        let s = ((((delta << 16) - 1) as u32) / (v as u32)) as u16;
+
+        let mut h = ((((mid - min) as u32) << 16) / (delta)) + 1;
+        if inverse {
+            h = HUE_EDGE_LEN - h;
+        }
+        h += edge * HUE_EDGE_LEN;
+
+        (h, s, v)
+    }
+
+    fn hsv2rgb(mut h: u32, s: u16, v: u8) -> (u8, u8, u8) {
+        if s == 0 || v == 0 {
+            return (v, v, v);
+        }
+
+        let delta: u32 = (((s as u32 * v as u32) >> 16) + 1) as u32;
+
+        // i guess it's fine if this is just the low bits of delta...?
+        let min: u8 = v - (delta as u8);
+        let mid: &mut u8;
+
+        let (mut r, mut g, mut b): (u8, u8, u8) = (0, 0, 0);
+
+        if h >= HUE_EDGE_LEN * 4 {
+            h -= HUE_EDGE_LEN * 4;
+            if h < HUE_EDGE_LEN {
+                b = v;
+                g = min;
+                mid = &mut r;
+            } else {
+                h -= HUE_EDGE_LEN;
+                h = HUE_EDGE_LEN - h;
+                r = v;
+                g = min;
+                mid = &mut b;
+            }
+        } else if h >= HUE_EDGE_LEN * 2 {
+            h -= HUE_EDGE_LEN * 2;
+            if h < HUE_EDGE_LEN {
+                g = v;
+                r = min;
+                mid = &mut b;
+            } else {
+                h -= HUE_EDGE_LEN;
+                h = HUE_EDGE_LEN - h;
+                b = v;
+                r = min;
+                mid = &mut g;
+            }
+        } else {
+            if h < HUE_EDGE_LEN {
+                r = v;
+                b = min;
+                mid = &mut g;
+            } else {
+                h -= HUE_EDGE_LEN;
+                h = HUE_EDGE_LEN - h;
+                g = v;
+                b = min;
+                mid = &mut r;
+            }
+        }
+
+        *mid = (((h * delta) >> 16) as u8) + min;
+
+        (r, g, b)
     }
 }
 
