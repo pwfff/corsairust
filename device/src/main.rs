@@ -8,7 +8,12 @@ mod messaging;
 extern crate alloc;
 
 use alloc::vec::{self, Vec};
+use bsp::hal::dma::{Channel, DMAExt, CH0, CH1};
+use bsp::hal::gpio::bank0::{Gpio0, Gpio1};
+use cortex_m::singleton;
 use embedded_alloc::Heap;
+use smart_leds_trait::RGB8;
+use ws2812_pio::{LEDBuf, LEDs, Ws2812Direct};
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -22,6 +27,10 @@ use hid::*;
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
 
+// PIOExt for the split() method that is needed to bring
+// PIO0 into useable form for Ws2812:
+use bsp::hal::pio::{PIOExt, UninitStateMachine, SM0};
+
 use bsp::{entry, XOSC_CRYSTAL_FREQ};
 use defmt::*;
 use defmt_rtt as _;
@@ -32,6 +41,7 @@ use fugit::ExtU32;
 use panic_probe as _;
 
 use bsp::hal::{
+    self,
     clocks::{init_clocks_and_plls, Clock},
     pac, prelude,
     sio::Sio,
@@ -95,6 +105,28 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
+    // Split the PIO state machine 0 into individual objects, so that
+    // Ws2812 can use it:
+    let (mut pio0, sm0, sm1, sm2, sm3) = pac.PIO0.split(&mut pac.RESETS);
+    let (mut pio1, sm4, sm5, sm6, sm7) = pac.PIO1.split(&mut pac.RESETS);
+    let dma = pac.DMA.split(&mut pac.RESETS);
+
+    // board is driving 16 LED chains, i guess?
+    // we have 8 state machines, so two chains per machine
+    let buf0: &'static mut [u32; 128] = singleton!(: [u32; 128] = [0xFFFFFFFF; 128]).unwrap();
+    let buf1: &'static mut [u32; 128] = singleton!(: [u32; 128] = [0xFFFFFFFF; 128]).unwrap();
+
+    let mut light = Ws2812Direct::new(
+        pins.gpio0.into_mode(),
+        pins.gpio1.into_mode(),
+        &mut pio0,
+        (dma.ch0, dma.ch1),
+        buf0,
+        buf1,
+        sm0,
+        clocks.peripheral_clock.freq(),
+    );
+
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -148,6 +180,10 @@ fn main() -> ! {
 
     info!("up");
 
+    let mut leds: LEDs<64, RGB8> = LEDs {
+        channel0: [RGB8::new(0xFF, 0x00, 0x00); 64],
+        channel1: [RGB8::new(0xFF, 0x00, 0x00); 64],
+    };
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
@@ -163,14 +199,19 @@ fn main() -> ! {
 
         if led_count_down.wait().is_ok() {
             if led_on {
+                leds.channel1 = [RGB8::new(0x00, 0xFF, 0x00); 64];
                 led_pin.set_low().unwrap();
                 led_on = false;
             } else {
+                leds.channel1 = [RGB8::new(0x00, 0x00, 0xFF); 64];
                 led_pin.set_high().unwrap();
                 led_on = true;
             }
+            light = light.write(&leds);
             led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
         }
+
+        // light = light.pump();
     }
 }
 

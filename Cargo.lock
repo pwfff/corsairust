@@ -216,9 +216,11 @@ dependencies = [
  "postcard",
  "rp-pico",
  "serde",
+ "smart-leds-trait",
  "ssmarshal",
  "usb-device",
  "usbd-hid",
+ "ws2812-pio",
 ]
 
 [[package]]
@@ -1187,6 +1189,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a507befe795404456341dfab10cef66ead4c041f62b8b11bbb92bffe5d0953e0"
 
 [[package]]
+name = "smart-leds-trait"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebf6d833fa93f16a1c1874e62c2aebe8567e5bdd436d59bf543ed258b6f7a8e3"
+dependencies = [
+ "rgb",
+]
+
+[[package]]
 name = "socket2"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1479,3 +1490,17 @@ name = "windows_x86_64_msvc"
 version = "0.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "447660ad36a13288b1db4d4248e857b510e8c3a225c822ba4fb748c0aafecffd"
+
+[[package]]
+name = "ws2812-pio"
+version = "0.6.0"
+dependencies = [
+ "cortex-m",
+ "embedded-dma",
+ "embedded-hal",
+ "fugit",
+ "nb 1.0.0",
+ "pio",
+ "rp2040-hal",
+ "smart-leds-trait",
+]
