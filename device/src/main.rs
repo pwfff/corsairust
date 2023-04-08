@@ -8,10 +8,9 @@ mod messaging;
 extern crate alloc;
 
 use alloc::vec::{self, Vec};
-use bsp::hal::dma::{Channel, DMAExt, CH0, CH1};
-use bsp::hal::gpio::bank0::{Gpio0, Gpio1};
+use bsp::hal::adc;
+use bsp::hal::dma::{DMAExt, CH0, CH1};
 use cortex_m::delay::Delay;
-use cortex_m::prelude::_embedded_hal_blocking_delay_DelayUs;
 use cortex_m::singleton;
 use embedded_alloc::Heap;
 use smart_leds_trait::RGB8;
@@ -134,6 +133,15 @@ fn main() -> ! {
         clocks.peripheral_clock.freq(),
     );
 
+    let (mut spec_reset, mut spec_strobe, mut spec_out) = (
+        pins.gpio16.into_push_pull_output(),
+        pins.gpio17.into_push_pull_output(),
+        pins.gpio28.into_floating_input(),
+    );
+    let mut adc = adc::Adc::new(pac.ADC, &mut pac.RESETS);
+
+    let mut spectrum = audio::Spectrum::default();
+
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -195,6 +203,7 @@ fn main() -> ! {
     let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
     let mut led_on = true;
+    let mut step = 6300;
     // Create a count_down timer for 500 milliseconds
     led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
     poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
@@ -217,18 +226,163 @@ fn main() -> ! {
             // for v in leds.channel0.iter() {
             //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
             // }
+
+            // step += 100;
+            // info!("{:?}", step);
+
+            info!("{:?}", spectrum.decay);
+
             led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
         }
 
-        for v in leds.channel0.iter_mut() {
-            hsv::step_hue(v, 12345)
+        for (i, v) in spectrum.decay.iter().enumerate() {
+            leds.channel0[i].r = (*v / (u8::MAX as u16)) as u8;
+            leds.channel0[i].g = (*v / (u8::MAX as u16)) as u8;
+            leds.channel0[i].b = (*v / (u8::MAX as u16)) as u8;
         }
-        for v in leds.channel1.iter_mut() {
-            hsv::step_hue(v, 12345)
-        }
+
+        // for v in leds.channel0.iter_mut() {
+        //     hsv::step_hue(v, step);
+        // }
+        // for v in leds.channel1.iter_mut() {
+        //     hsv::step_hue(v, step);
+        // }
         light = light.write(&mut delay, &leds);
 
+        spectrum.update(
+            &mut adc,
+            &mut delay.0,
+            &mut spec_reset,
+            &mut spec_strobe,
+            &mut spec_out,
+        );
+
         // light = light.pump();
+    }
+}
+
+mod audio {
+    use cortex_m::delay::Delay;
+    use embedded_hal::adc::{Channel, OneShot};
+    use embedded_hal::digital::v2::OutputPin;
+    use rp_pico::hal::gpio::PushPull;
+    use rp_pico::hal::{adc, gpio};
+
+    static SPECTRUM_FACTORS: [u16; 7] = [6, 8, 8, 8, 7, 7, 10];
+    const NOISEFLOOR: u16 = 65;
+    const SPECTRUMSMOOTH: u16 = 100;
+    const AGCSMOOTH: u32 = 2500;
+    const GAINUPPERLIMIT: u16 = 200;
+    const GAINLOWERLIMIT: u16 = 1;
+    const PEAKDECAY: u16 = 20;
+
+    pub struct Spectrum {
+        pub audio_avg: u32,
+        pub gain_agc: u16,
+        pub decay: [u8; 7],
+        pub peaks: [u8; 7],
+        history: [[u8; 100]; 7],
+        i_history: usize,
+        mins: [u8; 7],
+        mincounts: [u8; 7],
+        maxs: [u8; 7],
+        maxcounts: [u8; 7],
+    }
+
+    //uint8_t I = A + (uint8_t)(((int16_t)(B-A) * F) >> 8)
+
+    impl Default for Spectrum {
+        fn default() -> Self {
+            Self {
+                audio_avg: 300,
+                gain_agc: 10,
+                decay: [0u8; 7],
+                peaks: [0u8; 7],
+                history: [[0u8; 100]; 7],
+                i_history: 0,
+                mins: [0u8; 7],
+                mincounts: [0u8; 7],
+                maxs: [0u8; 7],
+                maxcounts: [0u8; 7],
+            }
+        }
+    }
+
+    impl Spectrum {
+        pub fn update<I: gpio::PinId, J: gpio::PinId, K: Channel<adc::Adc, ID = u8>>(
+            &mut self,
+            adc: &mut adc::Adc,
+            delay: &mut Delay,
+            reset: &mut gpio::Pin<I, gpio::Output<PushPull>>,
+            strobe: &mut gpio::Pin<J, gpio::Output<PushPull>>,
+            data: &mut K,
+        ) {
+            reset.set_high().unwrap();
+            delay.delay_us(5);
+            reset.set_low().unwrap();
+            delay.delay_us(10);
+
+            // store sum of values for AGC
+            let mut analogsum: u16 = 0;
+
+            let mut new_spectrum = [0u16; 7];
+
+            // cycle through each MSGEQ7 bin and read the analog values
+            for i in 0..7 {
+                // set up the MSGEQ7
+                strobe.set_low().unwrap();
+                delay.delay_us(25);
+
+                let temp1: u16 = adc.read(data).unwrap();
+                let temp2: u16 = adc.read(data).unwrap();
+                let temp3: u16 = adc.read(data).unwrap();
+
+                // read the analog value
+                new_spectrum[i] = (temp1 + temp2 + temp3) / 3;
+                strobe.set_high().unwrap();
+                delay.delay_us(30);
+
+                // noise floor filter
+                if new_spectrum[i] < NOISEFLOOR {
+                    new_spectrum[i] = 0;
+                } else {
+                    new_spectrum[i] -= NOISEFLOOR;
+                }
+
+                // apply correction factor per frequency bin
+                new_spectrum[i] *= SPECTRUM_FACTORS[i];
+                new_spectrum[i] /= 10;
+
+                // prepare average for AGC
+                analogsum += new_spectrum[i];
+
+                // apply current gain value
+                new_spectrum[i] = (new_spectrum[i] * self.gain_agc) / 10;
+
+                // process time-averaged values
+                self.decay[i] =
+                    ((self.decay[i] * (SPECTRUMSMOOTH - 1)) + new_spectrum[i]) / SPECTRUMSMOOTH;
+
+                // process peak values
+                if self.peaks[i] < self.decay[i] {
+                    self.peaks[i] = self.decay[i]
+                };
+                self.peaks[i] = self.peaks[i] / PEAKDECAY;
+            }
+
+            // Calculate audio levels for automatic gain
+            self.audio_avg =
+                (((AGCSMOOTH - 1) * self.audio_avg) + (analogsum as u32 / 7)) / AGCSMOOTH;
+
+            // Calculate gain adjustment factor
+            self.gain_agc = (300 / self.audio_avg) as u16;
+            if self.gain_agc > GAINUPPERLIMIT {
+                self.gain_agc = GAINUPPERLIMIT
+            };
+            if self.gain_agc < GAINLOWERLIMIT {
+                self.gain_agc = GAINLOWERLIMIT
+            };
+        }
     }
 }
 
@@ -261,10 +415,10 @@ mod hsv {
 
     const MAX_SATURATION: u16 = 0xFFFF;
 
-    const HUE_EDGE_LEN: u32 = 65537;
-    const MAX_HUE: u32 = HUE_EDGE_LEN * 6;
+    pub const HUE_EDGE_LEN: u32 = 65537;
+    pub const MAX_HUE: u32 = HUE_EDGE_LEN * 6;
 
-    fn rgb2hsv(r: u8, g: u8, b: u8) -> (u32, u16, u8) {
+    pub fn rgb2hsv(r: u8, g: u8, b: u8) -> (u32, u16, u8) {
         let (max, mid, min): (u8, u8, u8);
         let edge: u32;
         let inverse: bool;
@@ -318,7 +472,7 @@ mod hsv {
             return (0, 0, v);
         }
 
-        let s = ((((delta << 16) - 1) as u32) / (v as u32)) as u16;
+        let s = (((delta << 16) - 1) / (v as u32)) as u16;
 
         let mut h = ((((mid - min) as u32) << 16) / (delta)) + 1;
         if inverse {
@@ -329,7 +483,7 @@ mod hsv {
         (h, s, v)
     }
 
-    fn hsv2rgb(mut h: u32, s: u16, v: u8) -> (u8, u8, u8) {
+    pub fn hsv2rgb(h: u32, s: u16, v: u8) -> (u8, u8, u8) {
         if s == 0 || v == 0 {
             return (v, v, v);
         }
@@ -338,53 +492,66 @@ mod hsv {
 
         // i guess it's fine if this is just the low bits of delta...?
         let min: u8 = v - (delta as u8);
-        let mid: &mut u8;
 
-        let (mut r, mut g, mut b): (u8, u8, u8) = (0, 0, 0);
+        let i = (h / HUE_EDGE_LEN).min(5);
+        let f = h - HUE_EDGE_LEN * i;
+        let c = (((f * delta) >> 16) as u8) + min;
 
-        if h >= HUE_EDGE_LEN * 4 {
-            h -= HUE_EDGE_LEN * 4;
-            if h < HUE_EDGE_LEN {
-                b = v;
-                g = min;
-                mid = &mut r;
-            } else {
-                h -= HUE_EDGE_LEN;
-                h = HUE_EDGE_LEN - h;
-                r = v;
-                g = min;
-                mid = &mut b;
-            }
-        } else if h >= HUE_EDGE_LEN * 2 {
-            h -= HUE_EDGE_LEN * 2;
-            if h < HUE_EDGE_LEN {
-                g = v;
-                r = min;
-                mid = &mut b;
-            } else {
-                h -= HUE_EDGE_LEN;
-                h = HUE_EDGE_LEN - h;
-                b = v;
-                r = min;
-                mid = &mut g;
-            }
-        } else {
-            if h < HUE_EDGE_LEN {
-                r = v;
-                b = min;
-                mid = &mut g;
-            } else {
-                h -= HUE_EDGE_LEN;
-                h = HUE_EDGE_LEN - h;
-                g = v;
-                b = min;
-                mid = &mut r;
-            }
-        }
+        let (c, m) = (c as u8, min as u8);
 
-        *mid = (((h * delta) >> 16) as u8) + min;
+        let foos = [
+            (v, c, m),
+            (c, v, m),
+            (m, v, c),
+            (m, c, v),
+            (c, m, v),
+            (v, m, c),
+        ];
+        foos[i as usize]
 
-        (r, g, b)
+        // if h >= HUE_EDGE_LEN * 4 {
+        //     h -= HUE_EDGE_LEN * 4;
+        //     if h < HUE_EDGE_LEN {
+        //         b = v;
+        //         g = min;
+        //         mid = &mut r;
+        //     } else {
+        //         h -= HUE_EDGE_LEN;
+        //         h = HUE_EDGE_LEN - h;
+        //         r = v;
+        //         g = min;
+        //         mid = &mut b;
+        //     }
+        // } else if h >= HUE_EDGE_LEN * 2 {
+        //     h -= HUE_EDGE_LEN * 2;
+        //     if h < HUE_EDGE_LEN {
+        //         g = v;
+        //         r = min;
+        //         mid = &mut b;
+        //     } else {
+        //         h -= HUE_EDGE_LEN;
+        //         h = HUE_EDGE_LEN - h;
+        //         b = v;
+        //         r = min;
+        //         mid = &mut g;
+        //     }
+        // } else {
+        //     if h < HUE_EDGE_LEN {
+        //         r = v;
+        //         b = min;
+        //         mid = &mut g;
+        //     } else {
+        //         h -= HUE_EDGE_LEN;
+        //         h = HUE_EDGE_LEN - h;
+        //         g = v;
+        //         b = min;
+        //         mid = &mut r;
+        //     }
+        // }
+
+        // *mid = (((h * delta) >> 16) as u8) + min;
+
+        // (r, g, b)
     }
 }
 
