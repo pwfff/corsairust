@@ -1496,6 +1496,8 @@ name = "ws2812-pio"
 version = "0.6.0"
 dependencies = [
  "cortex-m",
+ "defmt",
+ "defmt-rtt",
  "embedded-dma",
  "embedded-hal",
  "fugit",
