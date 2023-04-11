@@ -9,7 +9,7 @@ extern crate alloc;
 
 use alloc::vec::{self, Vec};
 use bsp::hal::adc;
-use bsp::hal::dma::{DMAExt, CH0, CH1};
+use bsp::hal::dma::{DMAExt, SingleChannel, CH0, CH1};
 use cortex_m::delay::Delay;
 use cortex_m::singleton;
 use embedded_alloc::Heap;
@@ -19,6 +19,7 @@ use ws2812_pio::{buf, LEDs, Ws2812Direct};
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
+use crate::hsv::HSV64;
 use crate::messaging::packets::*;
 use messaging::wrapper::{self, MAX_BUFFER_SIZE, MAX_MESSAGE_SIZE};
 
@@ -124,27 +125,56 @@ fn main() -> ! {
 
     // board is driving 16 LED chains, i guess?
     // we have 8 state machines, so two chains per machine
-    const LEDS_PER_DEVICE: usize = 9;
-    let mut leds0: LEDs<LEDS_PER_DEVICE, RGB8> = LEDs {
-        channel0: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-        channel1: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-    };
-    let buf0_0 = buf!(LEDS_PER_DEVICE);
-    let buf0_1 = buf!(LEDS_PER_DEVICE);
+    const LEDS_PER_CHANNEL: usize = 9;
+    const BYTES_PER_CHANNEL: usize = ((LEDS_PER_CHANNEL * 24) + 31) / 32;
+    let mut leds0 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let buf0_0 = buf!(LEDS_PER_CHANNEL);
+    let buf0_1 = buf!(LEDS_PER_CHANNEL);
 
-    let mut leds1: LEDs<LEDS_PER_DEVICE, RGB8> = LEDs {
-        channel0: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-        channel1: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-    };
-    let buf1_0 = buf!(LEDS_PER_DEVICE);
-    let buf1_1 = buf!(LEDS_PER_DEVICE);
+    let mut leds1 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let buf1_0 = buf!(LEDS_PER_CHANNEL);
+    let buf1_1 = buf!(LEDS_PER_CHANNEL);
 
-    let mut leds2: LEDs<LEDS_PER_DEVICE, RGB8> = LEDs {
-        channel0: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-        channel1: [RGB8::new(0xFF, 0x00, 0x00); LEDS_PER_DEVICE],
-    };
-    let buf2_0 = buf!(LEDS_PER_DEVICE);
-    let buf2_1 = buf!(LEDS_PER_DEVICE);
+    let mut leds2 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let buf2_0 = buf!(LEDS_PER_CHANNEL);
+    let buf2_1 = buf!(LEDS_PER_CHANNEL);
+
+    let mut leds3 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let mut leds4 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let mut leds5 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let mut leds6 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+    let mut leds7 = LEDs::new(
+        [HSV64::default(); LEDS_PER_CHANNEL],
+        [HSV64::default(); LEDS_PER_CHANNEL],
+    );
+
+    let leds: [LEDs<9, HSV64>; 8] = [leds0, leds1, leds2, leds3, leds4, leds5, leds6, leds7];
+
+    dma.ch0
+        .ch()
+        .ch_al1_ctrl
+        .write(|w| unsafe { w.ring_size().bits(4) });
 
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut light0 = Ws2812Direct::new(
@@ -229,7 +259,13 @@ fn main() -> ! {
         USB_DEVICE = Some(usb_dev);
     }
 
-    let controller = Controller {};
+    let mut step = 1980;
+    // let mut step = 17200;
+    // let mut step = 5900;
+    // let mut step = 8000;
+    // let mut step = 12345;
+    // let mut step = 27500;
+    let mut controller = new_controller(leds, step);
     unsafe {
         CONTROLLER = Some(controller);
     }
@@ -252,11 +288,6 @@ fn main() -> ! {
     let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
     let mut led_on = true;
-    // let mut step = 0;
-    let mut step = 5900;
-    // let mut step = 8000;
-    // let mut step = 12345;
-    // let mut step = 27500;
     // Create a count_down timer for 500 milliseconds
     led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
     poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
@@ -283,14 +314,13 @@ fn main() -> ! {
             //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
             // }
 
-            // step += 100;
+            // step += 10;
             // info!("{:?}", step);
-
-            // // gotta fit these back into u32s, so split em up:
-            // // high bits: 0xAABB -> shift, 0x00AA -> truncate, 0xAA
-            // info!("{:X}", (smushed >> 32) as u32);
-            // // low bits: 0xAABB -> truncate, 0xBB
-            // info!("{:X}", smushed as u32);
+            // critical_section::with(|_| unsafe {
+            //     CONTROLLER.as_mut().map(|c| {
+            //         c.inc_step(10);
+            //     })
+            // });
 
             // info!("{:?}", spectrum.decay);
             // spectrum.attenuate();
@@ -320,29 +350,20 @@ fn main() -> ! {
         // for v in leds.channel0.iter_mut() {
         //     hsv::step_hue(v, step);
         // }
-        for v in leds0.channel0.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        for v in leds0.channel1.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        light0 = light0.write(&leds0);
+        // controller.step_hue();
 
-        for v in leds1.channel0.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        for v in leds1.channel1.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        light1 = light1.write(&leds1);
-
-        for v in leds2.channel0.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        for v in leds2.channel1.iter_mut() {
-            hsv::step_hue(v, step);
-        }
-        light2 = light2.write(&leds2);
+        let leds = critical_section::with(|_| unsafe {
+            CONTROLLER
+                .as_mut()
+                .map(|c| {
+                    c.step_hue();
+                    c.bufs()
+                })
+                .unwrap()
+        });
+        light0 = light0.write(&leds[0]);
+        light1 = light1.write(&leds[1]);
+        light2 = light2.write(&leds[2]);
 
         // spectrum.update(
         //     &mut adc,
@@ -508,6 +529,54 @@ impl ws2812_pio::DelayUs for Foo {
 mod hsv {
     use defmt::info;
     use smart_leds_trait::RGB8;
+
+    #[derive(Clone, Copy)]
+    pub struct HSV64 {
+        inc: bool,
+        pub h: u32,
+        pub s: u16,
+        pub v: u8,
+    }
+
+    impl HSV64 {
+        pub fn step_hue(&mut self, step: u32) {
+            if self.inc {
+                self.h += step;
+                if self.h > HUE_EDGE_LEN / 2 {
+                    self.h = HUE_EDGE_LEN / 2;
+                    self.inc = false
+                }
+            } else {
+                if self.h < step {
+                    self.h = 0;
+                    self.inc = true;
+                } else {
+                    self.h -= step
+                }
+            }
+            // if self.h > MAX_HUE {
+            //     self.h = 0
+            // }
+        }
+    }
+
+    impl Default for HSV64 {
+        fn default() -> Self {
+            Self {
+                inc: true,
+                h: 0,
+                s: u16::MAX,
+                v: 128,
+            }
+        }
+    }
+
+    impl Into<RGB8> for HSV64 {
+        fn into(self) -> RGB8 {
+            let (r, g, b) = hsv2rgb(self.h, self.s, self.v);
+            RGB8::new(r, g, b)
+        }
+    }
 
     pub fn step_hue(c: &mut RGB8, step: u32) {
         let (h, s, v) = rgb2hsv(c.r, c.g, c.b);
@@ -697,7 +766,7 @@ fn poll_usb() {
 
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 
-static mut CONTROLLER: Option<Controller> = None;
+static mut CONTROLLER: Option<Controller<9>> = None;
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.

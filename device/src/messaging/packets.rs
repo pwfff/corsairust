@@ -5,13 +5,27 @@ use corsairust_macros::all_fields_with;
 use defmt::debug;
 use openrgb_data::{OpenRGBReadableSync, OpenRGBWritableSync, PacketId, WriteVec};
 use serde::{Deserialize, Serialize};
+use ws2812_pio::LEDs;
+
+use crate::hsv::HSV64;
 
 use super::{Error, Result};
 
 pub static DEFAULT_PROTOCOL: u32 = 3;
 
-pub struct Controller {}
-impl Controller {
+pub struct Controller<const SIZE: usize> {
+    leds: [LEDs<SIZE, HSV64>; 8],
+    hue_step: u32,
+}
+
+pub fn new_controller<const SIZE: usize>(
+    leds: [LEDs<SIZE, HSV64>; 8],
+    hue_step: u32,
+) -> Controller<SIZE> {
+    Controller { leds, hue_step }
+}
+
+impl<const SIZE: usize> Controller<SIZE> {
     pub fn handle<'a>(&self, data_in: &Vec<u8>, data_out: &mut Vec<u8>) -> Result<()> {
         let mut w = WriteVec::new(data_out);
         let h = data_in.as_slice().read_any(DEFAULT_PROTOCOL)?;
@@ -26,6 +40,23 @@ impl Controller {
         }
     }
 
+    pub fn step_hue(&mut self) {
+        for leds in self.leds.iter_mut() {
+            for i in 0..leds.channel0.len() {
+                leds.channel0[i].step_hue(self.hue_step);
+                leds.channel1[i].step_hue(self.hue_step);
+            }
+        }
+    }
+
+    pub fn inc_step(&mut self, inc: u32) {
+        self.hue_step += inc;
+    }
+
+    pub fn bufs(&self) -> &[LEDs<SIZE, HSV64>] {
+        &self.leds
+    }
+
     fn controller_count(&self) -> u32 {
         69
     }
@@ -34,8 +65,8 @@ impl Controller {
 pub trait ResponseType {}
 
 pub trait Handler: Send + Sync + Sized {
-    fn handle<'a>(
-        controller: &Controller,
+    fn handle<'a, const SIZE: usize>(
+        controller: &Controller<SIZE>,
         data_in: &Vec<u8>,
         data_out: &mut WriteVec,
     ) -> Result<()>;
@@ -44,8 +75,8 @@ pub trait Handler: Send + Sync + Sized {
 pub struct RequestProtocolVersion {}
 
 impl Handler for RequestProtocolVersion {
-    fn handle<'a>(
-        controller: &Controller,
+    fn handle<'a, const SIZE: usize>(
+        controller: &Controller<SIZE>,
         data_in: &Vec<u8>,
         data_out: &mut WriteVec,
     ) -> Result<()> {
@@ -73,7 +104,11 @@ pub struct RequestControllerCountResponse {
 }
 
 impl Handler for RequestControllerCount {
-    fn handle(controller: &Controller, data_in: &Vec<u8>, data_out: &mut WriteVec) -> Result<()> {
+    fn handle<const SIZE: usize>(
+        controller: &Controller<SIZE>,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
         data_out
             .write_packet(
                 DEFAULT_PROTOCOL,
