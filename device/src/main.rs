@@ -14,24 +14,20 @@ use cortex_m::delay::Delay;
 use cortex_m::singleton;
 use embedded_alloc::Heap;
 use smart_leds_trait::RGB8;
-use ws2812_pio::{buf, LEDs, Ws2812Direct};
+use ws2812_pio::{dma_buf, leds, LEDs, Ws2812Direct};
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
 use crate::hsv::HSV64;
 use crate::messaging::packets::*;
-use messaging::wrapper::{self, MAX_BUFFER_SIZE, MAX_MESSAGE_SIZE};
+use messaging::wrapper::{self, MAX_MESSAGE_SIZE};
 
 use hid::*;
 
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
-
-// PIOExt for the split() method that is needed to bring
-// PIO0 into useable form for Ws2812:
-use bsp::hal::pio::{InstalledProgram, PIOExt, UninitStateMachine, SM0};
 
 use bsp::{entry, XOSC_CRYSTAL_FREQ};
 use defmt::*;
@@ -43,9 +39,8 @@ use fugit::ExtU32;
 use panic_probe as _;
 
 use bsp::hal::{
-    self,
     clocks::{init_clocks_and_plls, Clock},
-    pac, prelude,
+    pac,
     sio::Sio,
     usb,
     watchdog::Watchdog,
@@ -109,106 +104,61 @@ fn main() -> ! {
 
     // split the PIO state machines into individual objects, so that Ws2812 can use them.
     // each state machine will handle two channels of LEDs
-    let (mut pio0, sm0, sm1, sm2, sm3) = pac.PIO0.split(&mut pac.RESETS);
-    let (mut pio1, sm4, sm5, sm6, sm7) = pac.PIO1.split(&mut pac.RESETS);
-    let dma = pac.DMA.split(&mut pac.RESETS);
-
-    let program0 = ws2812_pio::init(&mut pio0);
-    let program0_0: InstalledProgram<pac::PIO0>;
-    let program0_1: InstalledProgram<pac::PIO0>;
-    let program0_2: InstalledProgram<pac::PIO0>;
-    unsafe {
-        program0_0 = program0.share();
-        program0_1 = program0.share();
-        program0_2 = program0.share();
-    }
 
     // board is driving 16 LED chains, i guess?
     // we have 8 state machines, so two chains per machine
     const LEDS_PER_CHANNEL: usize = 9;
     const BYTES_PER_CHANNEL: usize = ((LEDS_PER_CHANNEL * 24) + 31) / 32;
-    let mut leds0 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let buf0_0 = buf!(LEDS_PER_CHANNEL);
-    let buf0_1 = buf!(LEDS_PER_CHANNEL);
-
-    let mut leds1 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let buf1_0 = buf!(LEDS_PER_CHANNEL);
-    let buf1_1 = buf!(LEDS_PER_CHANNEL);
-
-    let mut leds2 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let buf2_0 = buf!(LEDS_PER_CHANNEL);
-    let buf2_1 = buf!(LEDS_PER_CHANNEL);
-
-    let mut leds3 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let mut leds4 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let mut leds5 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let mut leds6 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
-    let mut leds7 = LEDs::new(
-        [HSV64::default(); LEDS_PER_CHANNEL],
-        [HSV64::default(); LEDS_PER_CHANNEL],
-    );
+    let mut leds0 = leds!(HSV64, 9);
+    let mut leds1 = leds!(HSV64, 9);
+    let mut leds2 = leds!(HSV64, 9);
+    let mut leds3 = leds!(HSV64, 9);
+    let mut leds4 = leds!(HSV64, 9);
+    let mut leds5 = leds!(HSV64, 9);
+    let mut leds6 = leds!(HSV64, 9);
+    let mut leds7 = leds!(HSV64, 9);
 
     let leds: [LEDs<9, HSV64>; 8] = [leds0, leds1, leds2, leds3, leds4, leds5, leds6, leds7];
 
-    dma.ch0
-        .ch()
-        .ch_al1_ctrl
-        .write(|w| unsafe { w.ring_size().bits(4) });
+    // dma.ch0
+    //     .ch()
+    //     .ch_al1_ctrl
+    //     .write(|w| unsafe { w.ring_size().bits(4) });
 
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    let mut light0 = Ws2812Direct::new(
-        program0_0,
-        pins.gpio0.into_mode(),
-        pins.gpio1.into_mode(),
-        (dma.ch0, dma.ch1),
-        buf0_0,
-        buf0_1,
-        sm0,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
-    );
-
-    let mut light1 = Ws2812Direct::new(
-        program0_1,
-        pins.gpio2.into_mode(),
-        pins.gpio3.into_mode(),
-        (dma.ch2, dma.ch3),
-        buf1_0,
-        buf1_1,
-        sm1,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
-    );
-
-    let mut light2 = Ws2812Direct::new(
-        program0_2,
-        pins.gpio4.into_mode(),
-        pins.gpio5.into_mode(),
-        (dma.ch4, dma.ch5),
-        buf2_0,
-        buf2_1,
-        sm2,
+    let mut lights = Ws2812Direct::new(
+        pac.PIO0,
+        pac.PIO1,
+        pac.DMA.split(&mut pac.RESETS),
+        &mut pac.RESETS,
+        (
+            pins.gpio0.into_mode(),
+            pins.gpio1.into_mode(),
+            pins.gpio2.into_mode(),
+            pins.gpio3.into_mode(),
+            pins.gpio4.into_mode(),
+            pins.gpio5.into_mode(),
+            pins.gpio6.into_mode(),
+            pins.gpio7.into_mode(),
+            pins.gpio8.into_mode(),
+            pins.gpio9.into_mode(),
+            pins.gpio10.into_mode(),
+            pins.gpio11.into_mode(),
+            pins.gpio12.into_mode(),
+            pins.gpio13.into_mode(),
+            pins.gpio14.into_mode(),
+            pins.gpio15.into_mode(),
+        ),
+        (
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+            dma_buf!(),
+        ),
         clocks.peripheral_clock.freq(),
         timer.count_down(),
     );
@@ -283,8 +233,6 @@ fn main() -> ! {
 
     info!("up");
 
-    info!("led_us: {}", light0.led_us.to_micros());
-
     let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
     let mut led_on = true;
@@ -314,13 +262,13 @@ fn main() -> ! {
             //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
             // }
 
-            // step += 10;
-            // info!("{:?}", step);
-            // critical_section::with(|_| unsafe {
-            //     CONTROLLER.as_mut().map(|c| {
-            //         c.inc_step(10);
-            //     })
-            // });
+            step += 100;
+            info!("{:?}", step);
+            critical_section::with(|_| unsafe {
+                CONTROLLER.as_mut().map(|c| {
+                    c.inc_step(100);
+                })
+            });
 
             // info!("{:?}", spectrum.decay);
             // spectrum.attenuate();
@@ -361,9 +309,7 @@ fn main() -> ! {
                 })
                 .unwrap()
         });
-        light0 = light0.write(&leds[0]);
-        light1 = light1.write(&leds[1]);
-        light2 = light2.write(&leds[2]);
+        lights = lights.write(leds);
 
         // spectrum.update(
         //     &mut adc,
@@ -542,10 +488,14 @@ mod hsv {
         pub fn step_hue(&mut self, step: u32) {
             if self.inc {
                 self.h += step;
-                if self.h > HUE_EDGE_LEN / 2 {
-                    self.h = HUE_EDGE_LEN / 2;
+                if self.h > MAX_HUE {
+                    self.h = MAX_HUE;
                     self.inc = false
                 }
+                // if self.h > HUE_EDGE_LEN / 2 {
+                //     self.h = HUE_EDGE_LEN / 2;
+                //     self.inc = false
+                // }
             } else {
                 if self.h < step {
                     self.h = 0;
@@ -557,6 +507,15 @@ mod hsv {
             // if self.h > MAX_HUE {
             //     self.h = 0
             // }
+        }
+
+        pub const fn new() -> Self {
+            Self {
+                inc: true,
+                h: 0,
+                s: u16::MAX,
+                v: 128,
+            }
         }
     }
 

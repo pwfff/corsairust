@@ -1498,11 +1498,13 @@ dependencies = [
  "cortex-m",
  "defmt",
  "defmt-rtt",
+ "embedded-alloc",
  "embedded-dma",
  "embedded-hal",
  "fugit",
  "nb 1.0.0",
  "pio",
+ "rp-pico",
  "rp2040-hal",
  "smart-leds-trait",
 ]

@@ -25,8 +25,8 @@ pub fn new_controller<const SIZE: usize>(
     Controller { leds, hue_step }
 }
 
-impl<const SIZE: usize> Controller<SIZE> {
-    pub fn handle<'a>(&self, data_in: &Vec<u8>, data_out: &mut Vec<u8>) -> Result<()> {
+impl<'a, const SIZE: usize> Controller<SIZE> {
+    pub fn handle(&self, data_in: &Vec<u8>, data_out: &mut Vec<u8>) -> Result<()> {
         let mut w = WriteVec::new(data_out);
         let h = data_in.as_slice().read_any(DEFAULT_PROTOCOL)?;
         match h.packet_id {
@@ -53,7 +53,7 @@ impl<const SIZE: usize> Controller<SIZE> {
         self.hue_step += inc;
     }
 
-    pub fn bufs(&self) -> &[LEDs<SIZE, HSV64>] {
+    pub fn bufs(&self) -> &[LEDs<SIZE, HSV64>; 8] {
         &self.leds
     }
 
