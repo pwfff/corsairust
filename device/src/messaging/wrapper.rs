@@ -68,14 +68,24 @@ pub fn write_all<'a>(
 
     let mut i = 0;
     while len > 0 {
+        debug!("{} left to write", len);
         let mut j = MAX_BUFFER_SIZE;
         if len < j {
             j = len;
+            rep.input_buffer.fill(0);
         }
         rep.input_buffer[0..j].copy_from_slice(&message_buffer[i..i + j]);
-        let n = usb_hid.push_input(&rep)?;
+        let n = loop {
+            match usb_hid.push_input(&rep) {
+                Ok(n) => break n,
+                Err(e) => match e {
+                    UsbError::WouldBlock => {}
+                    e => return Err(e),
+                },
+            }
+        };
 
-        debug!("wrote {} encoded bytes", j);
+        debug!("wrote {} encoded bytes: {:X}", j, message_buffer[i..i + j]);
 
         if len >= MAX_BUFFER_SIZE {
             len -= MAX_BUFFER_SIZE;
@@ -83,6 +93,7 @@ pub fn write_all<'a>(
             len = 0;
         }
         i += MAX_BUFFER_SIZE;
+        debug!("i {} j {} len {}", i, j, len);
     }
 
     Ok(())

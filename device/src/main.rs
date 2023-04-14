@@ -209,7 +209,8 @@ fn main() -> ! {
         USB_DEVICE = Some(usb_dev);
     }
 
-    let mut step = 1980;
+    let mut step = 10110;
+    // let mut step = 19080;
     // let mut step = 17200;
     // let mut step = 5900;
     // let mut step = 8000;
@@ -262,13 +263,13 @@ fn main() -> ! {
             //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
             // }
 
-            step += 100;
-            info!("{:?}", step);
-            critical_section::with(|_| unsafe {
-                CONTROLLER.as_mut().map(|c| {
-                    c.inc_step(100);
-                })
-            });
+            // step += 100;
+            // info!("{:?}", step);
+            // critical_section::with(|_| unsafe {
+            //     CONTROLLER.as_mut().map(|c| {
+            //         c.inc_step(100);
+            //     })
+            // });
 
             // info!("{:?}", spectrum.decay);
             // spectrum.attenuate();
@@ -537,17 +538,6 @@ mod hsv {
         }
     }
 
-    pub fn step_hue(c: &mut RGB8, step: u32) {
-        let (h, s, v) = rgb2hsv(c.r, c.g, c.b);
-
-        let mut new = h + step;
-        if new > MAX_HUE {
-            new = new - MAX_HUE;
-        }
-
-        (c.r, c.g, c.b) = hsv2rgb(new, s, 128);
-    }
-
     // neato: https://www.sciencedirect.com/science/article/abs/pii/S0045790615002827
     // found implemented here: https://bitbucket.org/chernov/colormath_hsv/src/master/colormath/hsv.cpp
     const MAX_VALUE: u8 = 0xFF;
@@ -627,14 +617,17 @@ mod hsv {
             return (v, v, v);
         }
 
-        let delta: u32 = (((s as u32 * v as u32) >> 16) + 1) as u32;
+        let delta: u8 = (((s as u32 * v as u32) >> 16) + 1) as u8;
 
         // i guess it's fine if this is just the low bits of delta...?
         let min: u8 = v - (delta as u8);
 
         let i = (h / HUE_EDGE_LEN).min(5);
-        let f = h - HUE_EDGE_LEN * i;
-        let c = (((f * delta) >> 16) as u8) + min;
+        let mut f = h - HUE_EDGE_LEN * i;
+        if i % 2 == 1 {
+            f = HUE_EDGE_LEN - f;
+        }
+        let c = (((f * delta as u32) >> 16) as u8) + min;
 
         let (c, m) = (c as u8, min as u8);
 
@@ -725,7 +718,7 @@ fn poll_usb() {
 
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 
-static mut CONTROLLER: Option<Controller<9>> = None;
+static mut CONTROLLER: Option<DeviceController<9>> = None;
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.
@@ -740,7 +733,7 @@ unsafe fn USBCTRL_IRQ() {
         match r {
             Ok(data) => {
                 let controller = CONTROLLER.as_mut().unwrap();
-                let mut resp: Vec<u8> = Vec::with_capacity(MAX_MESSAGE_SIZE);
+                let mut resp: Vec<u8> = Vec::new();
                 match controller.handle(&data.into(), &mut resp) {
                     Ok(_) => {
                         wrapper::write_all(usb_hid, &mut resp).map_err(handle_usberror);

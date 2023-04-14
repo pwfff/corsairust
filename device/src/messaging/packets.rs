@@ -1,9 +1,11 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::ToString, vec::Vec};
 use corsairust_macros::all_fields_with;
 use defmt::debug;
-use openrgb_data::{OpenRGBReadableSync, OpenRGBWritableSync, PacketId, WriteVec};
+use openrgb_data::{
+    Controller, DeviceType, Header, OpenRGBReadableSync, OpenRGBWritableSync, PacketId, WriteVec,
+};
 use serde::{Deserialize, Serialize};
 use ws2812_pio::LEDs;
 
@@ -13,7 +15,7 @@ use super::{Error, Result};
 
 pub static DEFAULT_PROTOCOL: u32 = 3;
 
-pub struct Controller<const SIZE: usize> {
+pub struct DeviceController<const SIZE: usize> {
     leds: [LEDs<SIZE, HSV64>; 8],
     hue_step: u32,
 }
@@ -21,20 +23,23 @@ pub struct Controller<const SIZE: usize> {
 pub fn new_controller<const SIZE: usize>(
     leds: [LEDs<SIZE, HSV64>; 8],
     hue_step: u32,
-) -> Controller<SIZE> {
-    Controller { leds, hue_step }
+) -> DeviceController<SIZE> {
+    DeviceController { leds, hue_step }
 }
 
-impl<'a, const SIZE: usize> Controller<SIZE> {
+impl<'a, const SIZE: usize> DeviceController<SIZE> {
     pub fn handle(&self, data_in: &Vec<u8>, data_out: &mut Vec<u8>) -> Result<()> {
         let mut w = WriteVec::new(data_out);
         let h = data_in.as_slice().read_any(DEFAULT_PROTOCOL)?;
         match h.packet_id {
             PacketId::RequestControllerCount => {
-                RequestControllerCount::handle(self, data_in, &mut w)
+                RequestControllerCount::handle(self, h, data_in, &mut w)
             }
             PacketId::RequestProtocolVersion => {
-                RequestProtocolVersion::handle(self, data_in, &mut w)
+                RequestProtocolVersion::handle(self, h, data_in, &mut w)
+            }
+            PacketId::RequestControllerData => {
+                RequestControllerData::handle(self, h, data_in, &mut w)
             }
             i => Err(Error::UnknownPacket(9999)),
         }
@@ -42,7 +47,7 @@ impl<'a, const SIZE: usize> Controller<SIZE> {
 
     pub fn step_hue(&mut self) {
         for leds in self.leds.iter_mut() {
-            for i in 0..leds.channel0.len() {
+            for i in 0..SIZE {
                 leds.channel0[i].step_hue(self.hue_step);
                 leds.channel1[i].step_hue(self.hue_step);
             }
@@ -66,7 +71,8 @@ pub trait ResponseType {}
 
 pub trait Handler: Send + Sync + Sized {
     fn handle<'a, const SIZE: usize>(
-        controller: &Controller<SIZE>,
+        controller: &DeviceController<SIZE>,
+        header: Header,
         data_in: &Vec<u8>,
         data_out: &mut WriteVec,
     ) -> Result<()>;
@@ -76,7 +82,8 @@ pub struct RequestProtocolVersion {}
 
 impl Handler for RequestProtocolVersion {
     fn handle<'a, const SIZE: usize>(
-        controller: &Controller<SIZE>,
+        controller: &DeviceController<SIZE>,
+        header: Header,
         data_in: &Vec<u8>,
         data_out: &mut WriteVec,
     ) -> Result<()> {
@@ -96,16 +103,10 @@ impl Handler for RequestProtocolVersion {
 
 pub struct RequestControllerCount {}
 
-#[all_fields_with("postcard::fixint::le")]
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub struct RequestControllerCountResponse {
-    packet_id: u32,
-    controller_count: u32,
-}
-
 impl Handler for RequestControllerCount {
     fn handle<const SIZE: usize>(
-        controller: &Controller<SIZE>,
+        controller: &DeviceController<SIZE>,
+        header: Header,
         data_in: &Vec<u8>,
         data_out: &mut WriteVec,
     ) -> Result<()> {
@@ -114,8 +115,43 @@ impl Handler for RequestControllerCount {
                 DEFAULT_PROTOCOL,
                 // TODO: device ids i guess?
                 0,
-                PacketId::RequestProtocolVersion,
+                PacketId::RequestControllerCount,
                 controller.controller_count(),
+            )
+            .map_err(|e| e.into())
+    }
+}
+
+pub struct RequestControllerData {}
+
+impl Handler for RequestControllerData {
+    fn handle<const SIZE: usize>(
+        controller: &DeviceController<SIZE>,
+        header: Header,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
+        let c = Controller {
+            r#type: DeviceType::LEDStrip,
+            name: "foo".to_string(),
+            vendor: "vendor".to_string(),
+            description: "vendor".to_string(),
+            version: "vendor".to_string(),
+            serial: "vendor".to_string(),
+            location: "vendor".to_string(),
+            active_mode: 0,
+            modes: Vec::new(),
+            zones: Vec::new(),
+            leds: Vec::new(),
+            colors: Vec::new(),
+        };
+        data_out
+            .write_packet(
+                DEFAULT_PROTOCOL,
+                // TODO: device ids i guess?
+                header.device_id,
+                PacketId::RequestControllerData,
+                c,
             )
             .map_err(|e| e.into())
     }

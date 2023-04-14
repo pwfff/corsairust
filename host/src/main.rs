@@ -13,7 +13,10 @@ use openrgb_data::{
 use std::pin::Pin;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{
+        tcp::{ReadHalf, WriteHalf},
+        TcpListener, TcpStream,
+    },
     select,
     time::{sleep, Duration},
 };
@@ -57,14 +60,17 @@ async fn main() -> io::Result<()> {
     let s = TcpListener::bind("127.0.0.1:6742").await?;
 
     println!("listening on 6742");
+    println!("{:?}", s.ttl());
 
     loop {
         select! {
-            Ok((socket, _)) = s.accept() => {
+            Ok((mut socket, _)) = s.accept() => {
+                socket.set_nodelay(true)?;
+                let (reader, mut writer) = socket.split();
                 let mut reader = Blocker {
-                    s: Box::pin(socket),
+                    s: Box::pin(reader),
                 };
-                match handle(&w, &mut reader).await {
+                match handle(&w, &mut reader, &mut writer).await {
                     Ok(_) => println!("handled a packet bruv"),
                     Err(e) => println!("error handling packet: {}", e.display_chain().to_string()),
                 };
@@ -86,15 +92,15 @@ async fn main() -> io::Result<()> {
     }
 }
 
-async fn handle(dev: &DevWriter, s: &mut Blocker) -> Result<()> {
+async fn handle<'a>(dev: &DevWriter, s: &mut Blocker<'a>, w: &mut WriteHalf<'a>) -> Result<()> {
     loop {
         let header = s
             .read_any(DEFAULT_PROTOCOL)
-            .map_err(|e| format!("{:?}", e))?;
-        println!("got header {:?}", header);
+            .map_err(|e| format!("{:X?}", e))?;
+        println!("got header {:X?}", header);
         let mut buf = vec![0; header.len as usize];
         s.read_exact(&mut buf).await?;
-        println!("got rest of packet {:?}", buf);
+        println!("got rest of packet {:X?}", buf);
 
         let total_len = header.len as usize + header.size(DEFAULT_PROTOCOL);
         let mut packet: Vec<u8> = Vec::<u8>::with_capacity(total_len);
@@ -107,22 +113,32 @@ async fn handle(dev: &DevWriter, s: &mut Blocker) -> Result<()> {
 
         dev.write(&encoded)?;
 
-        let (got, mut gotted) = dev.read()?;
+        let mut from_device = Vec::<u8>::new();
+        loop {
+            let (got, mut gotted) = dev.read()?;
+            println!("cobbed {}: {:X?}", got, gotted);
+            from_device.append(&mut gotted.to_vec());
+            if gotted.iter().any(|b| *b == 0) {
+                break;
+            }
+        }
         //TODO: don't unwrap or something idk
-        cobs::decode_in_place(gotted.as_mut()).unwrap();
-        println!("{}: {:X?}", got, gotted);
+        println!("all cobbed {}: {:X?}", from_device.len(), from_device);
+        cobs::decode_in_place(from_device.as_mut()).unwrap();
+        println!("uncobbed {}: {:X?}", from_device.len(), from_device);
         // orf orf orf orf
         // let f = header.size(DEFAULT_PROTOCOL);
 
-        let header = gotted.as_ref().read_any(DEFAULT_PROTOCOL)?;
+        let header = from_device.as_slice().read_any(DEFAULT_PROTOCOL)?;
+        println!("header from device: {:X?}", header);
         let len = header.len as usize;
         println!(
             "forwarding response {}: {:X?} {:X?}",
             len,
             header,
-            &gotted[16..16 + len]
+            &from_device[..16 + len]
         );
-        s.write_all(&gotted[..16 + len]).await?;
+        w.write_all(&from_device[..16 + len]).await?;
     }
 }
 
@@ -145,7 +161,7 @@ impl DevWriter {
     }
 
     fn read(&self) -> Result<(usize, Box<[u8]>)> {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 32];
         let read = self.open()?.read_timeout(&mut buf, 150)?;
         Ok((read, Box::new(buf)))
     }
@@ -155,11 +171,11 @@ struct TinyController {}
 
 // impl RGBControllerInterface for TinyController {}
 
-pub struct Blocker {
-    s: Pin<Box<TcpStream>>,
+pub struct Blocker<'a> {
+    s: Pin<Box<ReadHalf<'a>>>,
 }
 
-impl AsyncRead for Blocker {
+impl<'a> AsyncRead for Blocker<'a> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -169,51 +185,17 @@ impl AsyncRead for Blocker {
     }
 }
 
-impl std::io::Read for Blocker {
+impl<'a> std::io::Read for Blocker<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         block_on(AsyncReadExt::read(self, buf))
     }
 }
 
-impl genio::Read for Blocker {
+impl<'a> genio::Read for Blocker<'a> {
     type ReadError = crate::ErrorKind;
 
     fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, Self::ReadError> {
         std::io::Read::read(self, buf).map_err(|e| ErrorKind::Msg(format!("{}", e)))
-    }
-}
-
-impl AsyncWrite for Blocker {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        self.s.as_mut().poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.s.as_mut().poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.s.as_mut().poll_shutdown(cx)
-    }
-}
-
-impl std::io::Write for Blocker {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        block_on(AsyncWriteExt::write(self, buf))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        block_on(AsyncWriteExt::flush(self))
     }
 }
 
@@ -222,21 +204,3 @@ impl std::io::Write for Blocker {
 //         GenioWrite::new(value)
 //     }
 // }
-
-impl genio::Write for Blocker {
-    type WriteError = ErrorKind;
-
-    type FlushError = ErrorKind;
-
-    fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, Self::WriteError> {
-        std::io::Write::write(self, buf).map_err(|e| ErrorKind::Msg(format!("{}", e)))
-    }
-
-    fn flush(&mut self) -> std::result::Result<(), Self::FlushError> {
-        std::io::Write::flush(self).map_err(|e| ErrorKind::Msg(format!("{}", e)))
-    }
-
-    fn size_hint(&mut self, bytes: usize) {}
-}
-
-impl OpenRGBSync for Blocker {}
