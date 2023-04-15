@@ -4,13 +4,17 @@ extern crate hidapi;
 
 use error_chain::ChainedError;
 use futures::executor::block_on;
+use genio::Read;
 use hidapi::HidDevice;
-use openrgb::DEFAULT_PROTOCOL;
-use openrgb_data::{
-    Controller, Header, OpenRGBError, OpenRGBReadable, OpenRGBReadableSync, OpenRGBSync,
-    OpenRGBWritable, OpenRGBWritableSync, PacketId,
+use openrgb::{
+    data::OpenRGBReadable, data::OpenRGBWritable, OpenRGBReadableStream, OpenRGBStream,
+    OpenRGBWritableStream, DEFAULT_PROTOCOL,
 };
-use std::pin::Pin;
+use openrgb_data::{
+    Controller, Header, OpenRGBError, OpenRGBReadableSync, OpenRGBSync, OpenRGBWritableSync,
+    PacketId,
+};
+use std::{pin::Pin, sync::Arc};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
@@ -18,6 +22,7 @@ use tokio::{
         TcpListener, TcpStream,
     },
     select,
+    sync::Mutex,
     time::{sleep, Duration},
 };
 
@@ -34,6 +39,12 @@ mod errors {
             }
     }
 
+    impl From<openrgb::OpenRGBError> for Error {
+        fn from(s: openrgb::OpenRGBError) -> Self {
+            format!("{:?}", s).into()
+        }
+    }
+
     impl From<OpenRGBError> for Error {
         fn from(s: OpenRGBError) -> Self {
             format!("{:?}", s).into()
@@ -45,15 +56,17 @@ use errors::*;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    tracing_subscriber::fmt::init();
+
     // Connect to device using its VID and PID
     let (VID, PID) = (0x16d0, 0x1124);
 
     let api = hidapi::HidApi::new().unwrap();
 
-    let w = DevWriter {
+    let w = Arc::new(Mutex::new(DevWriter {
         api,
         address: (VID, PID),
-    };
+    }));
 
     // spawn(s.serve());
 
@@ -63,65 +76,64 @@ async fn main() -> io::Result<()> {
     println!("{:?}", s.ttl());
 
     loop {
-        select! {
-            Ok((mut socket, _)) = s.accept() => {
+        match s.accept().await {
+            Ok((mut socket, _)) => {
                 socket.set_nodelay(true)?;
-                let (reader, mut writer) = socket.split();
-                let mut reader = Blocker {
-                    s: Box::pin(reader),
-                };
-                match handle(&w, &mut reader, &mut writer).await {
-                    Ok(_) => println!("handled a packet bruv"),
-                    Err(e) => println!("error handling packet: {}", e.display_chain().to_string()),
-                };
-            }
-
-            _ = sleep(Duration::from_millis(100)) => {
-                match w.read() {
-                    Ok((s, b)) => {
-                        if s > 0 {
-                            println!("unexpected input from device: {b:X?}");
+                // let mut reader = Blocker {
+                //     s: Box::pin(reader),
+                // };
+                let w = w.clone();
+                tokio::spawn(async move {
+                    match handle(w, socket).await {
+                        Ok(_) => println!("handled a packet bruv"),
+                        Err(e) => {
+                            println!("error handling packet: {}", e.display_chain().to_string())
                         }
                     }
-                    Err(e) => {
-                        println!("{e:?}")
-                    }
-                }
+                });
             }
+            Err(_) => {}
         }
     }
 }
 
-async fn handle<'a>(dev: &DevWriter, s: &mut Blocker<'a>, w: &mut WriteHalf<'a>) -> Result<()> {
+async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
     loop {
-        let header = s
+        println!("looking for packet");
+        let header = sock
             .read_any(DEFAULT_PROTOCOL)
+            .await
             .map_err(|e| format!("{:X?}", e))?;
         println!("got header {:X?}", header);
         let mut buf = vec![0; header.len as usize];
-        s.read_exact(&mut buf).await?;
+        sock.read_exact(&mut buf).await?;
         println!("got rest of packet {:X?}", buf);
 
         let total_len = header.len as usize + header.size(DEFAULT_PROTOCOL);
         let mut packet: Vec<u8> = Vec::<u8>::with_capacity(total_len);
-        header.write(&mut packet, DEFAULT_PROTOCOL)?;
-        buf.write(&mut packet, DEFAULT_PROTOCOL)?;
+        header.write(&mut packet, DEFAULT_PROTOCOL).await?;
+        buf.write(&mut packet, DEFAULT_PROTOCOL).await?;
 
         println!("forwarding {:X?}", packet);
 
         let encoded = cobs::encode_vec(&packet);
 
-        dev.write(&encoded)?;
+        let mut from_device = {
+            let lock = dev.lock().await;
+            lock.write(&encoded)?;
 
-        let mut from_device = Vec::<u8>::new();
-        loop {
-            let (got, mut gotted) = dev.read()?;
-            println!("cobbed {}: {:X?}", got, gotted);
-            from_device.append(&mut gotted.to_vec());
-            if gotted.iter().any(|b| *b == 0) {
-                break;
+            let mut from_device = Vec::<u8>::new();
+            loop {
+                let (got, gotted) = lock.read()?;
+                println!("cobbed {}: {:X?}", got, gotted);
+                from_device.append(&mut gotted.to_vec());
+                if gotted.iter().any(|b| *b == 0) {
+                    break;
+                }
             }
-        }
+            from_device
+        };
+
         //TODO: don't unwrap or something idk
         println!("all cobbed {}: {:X?}", from_device.len(), from_device);
         cobs::decode_in_place(from_device.as_mut()).unwrap();
@@ -138,7 +150,8 @@ async fn handle<'a>(dev: &DevWriter, s: &mut Blocker<'a>, w: &mut WriteHalf<'a>)
             header,
             &from_device[..16 + len]
         );
-        w.write_all(&from_device[..16 + len]).await?;
+        sock.write_all(&from_device[..16 + len]).await?;
+        println!("wrote response {}: {:X?}", len, &from_device[..16 + len]);
     }
 }
 
@@ -166,41 +179,3 @@ impl DevWriter {
         Ok((read, Box::new(buf)))
     }
 }
-
-struct TinyController {}
-
-// impl RGBControllerInterface for TinyController {}
-
-pub struct Blocker<'a> {
-    s: Pin<Box<ReadHalf<'a>>>,
-}
-
-impl<'a> AsyncRead for Blocker<'a> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.s.as_mut().poll_read(cx, buf)
-    }
-}
-
-impl<'a> std::io::Read for Blocker<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        block_on(AsyncReadExt::read(self, buf))
-    }
-}
-
-impl<'a> genio::Read for Blocker<'a> {
-    type ReadError = crate::ErrorKind;
-
-    fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, Self::ReadError> {
-        std::io::Read::read(self, buf).map_err(|e| ErrorKind::Msg(format!("{}", e)))
-    }
-}
-
-// impl From<Blocker> for GenioWrite<Blocker> {
-//     fn from(value: Blocker) -> Self {
-//         GenioWrite::new(value)
-//     }
-// }
