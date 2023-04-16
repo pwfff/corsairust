@@ -137,7 +137,8 @@ fn core1_task(sys_freq: u32) -> ! {
     leds[6].fill(bufs.6);
     leds[7].fill(bufs.7);
 
-    let mut step = 0;
+    let mut step = hsv::HUE_EDGE_LEN;
+    // let mut step = 42000;
     cortex_m::interrupt::free(|cs| {
         let _lock = Spinlock0::claim();
         unsafe {
@@ -179,17 +180,17 @@ fn core1_task(sys_freq: u32) -> ! {
     // Create a count_down timer for 500 milliseconds
     led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
     loop {
-        if led_count_down.wait().is_ok() {
-            let inc = 1;
-            step += inc;
-            info!("{:?}", step);
-            cortex_m::interrupt::free(|cs| {
-                let _lock = Spinlock0::claim();
-                let controller = unsafe { CONTROLLER.as_mut().unwrap() };
-                controller.inc_step(inc);
-            });
-            led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
-        }
+        // if led_count_down.wait().is_ok() {
+        //     let inc = 100;
+        //     step += inc;
+        //     info!("{:?}", step);
+        //     cortex_m::interrupt::free(|cs| {
+        //         let _lock = Spinlock0::claim();
+        //         let controller = unsafe { CONTROLLER.as_mut().unwrap() };
+        //         controller.inc_step(inc);
+        //     });
+        //     led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
+        // }
 
         // let input = sio.fifo.read();
         // if let Some(word) = input {

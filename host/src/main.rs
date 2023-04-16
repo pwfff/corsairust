@@ -126,9 +126,11 @@ async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
             loop {
                 let (got, gotted) = lock.read()?;
                 println!("cobbed {}: {:X?}", got, gotted);
-                from_device.append(&mut gotted.to_vec());
-                if gotted.iter().any(|b| *b == 0) {
-                    break;
+                if got > 0 {
+                    from_device.append(&mut gotted.to_vec());
+                    if gotted.iter().any(|b| *b == 0) {
+                        break;
+                    }
                 }
             }
             from_device
@@ -175,7 +177,7 @@ impl DevWriter {
 
     fn read(&self) -> Result<(usize, Box<[u8]>)> {
         let mut buf = [0u8; 32];
-        let read = self.open()?.read_timeout(&mut buf, 150)?;
+        let read = self.open()?.read(&mut buf)?;
         Ok((read, Box::new(buf)))
     }
 }
