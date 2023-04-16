@@ -10,7 +10,13 @@ extern crate alloc;
 use alloc::vec::{self, Vec};
 use bsp::hal::adc;
 use bsp::hal::dma::{DMAExt, SingleChannel, CH0, CH1};
+use bsp::hal::multicore::{Multicore, Stack};
+use bsp::hal::sio::Spinlock0;
+use core::cell::{RefCell, RefMut};
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::AtomicPtr;
 use cortex_m::delay::Delay;
+use cortex_m::interrupt::Mutex;
 use cortex_m::singleton;
 use embedded_alloc::Heap;
 use smart_leds_trait::RGB8;
@@ -46,6 +52,7 @@ use bsp::hal::{
     watchdog::Watchdog,
     Timer,
 };
+
 use pac::interrupt;
 
 // USB Device support
@@ -63,26 +70,27 @@ static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBus>> = None;
 /// The USB Human Interface Device Driver (shared with the interrupt).
 static mut USB_HID: Option<HIDClass<usb::UsbBus>> = None;
 
+static mut CONTROLLER: Option<DeviceController<9>> = None;
+
 const USB_POLL_RATE_MILLIS: u32 = 100;
 const LED_BLINK_RATE_MILLIS: u32 = 500;
 
-#[entry]
-fn main() -> ! {
-    info!("Program start");
+static mut CORE1_STACK: Stack<4096> = Stack::new();
 
-    {
-        use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 1024 * 32;
-        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
-    }
-    info!("allocator initialized");
-    let mut pac = pac::Peripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let sio = Sio::new(pac.SIO);
+fn core1_task(sys_freq: u32) -> ! {
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let core = unsafe { pac::CorePeripherals::steal() };
 
-    // External high-speed crystal on the pico board is 12Mhz
+    let mut sio = Sio::new(pac.SIO);
+    let pins = bsp::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
     let external_xtal_freq_hz = XOSC_CRYSTAL_FREQ;
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let clocks = init_clocks_and_plls(
         external_xtal_freq_hz,
         pac.XOSC,
@@ -95,35 +103,47 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let pins = bsp::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    // split the PIO state machines into individual objects, so that Ws2812 can use them.
-    // each state machine will handle two channels of LEDs
-
     // board is driving 16 LED chains, i guess?
     // we have 8 state machines, so two chains per machine
     const LEDS_PER_CHANNEL: usize = 9;
-    const BYTES_PER_CHANNEL: usize = ((LEDS_PER_CHANNEL * 24) + 31) / 32;
-    let mut leds0 = leds!(HSV64, 9);
-    let mut leds1 = leds!(HSV64, 9);
-    let mut leds2 = leds!(HSV64, 9);
-    let mut leds3 = leds!(HSV64, 9);
-    let mut leds4 = leds!(HSV64, 9);
-    let mut leds5 = leds!(HSV64, 9);
-    let mut leds6 = leds!(HSV64, 9);
-    let mut leds7 = leds!(HSV64, 9);
+    let leds0 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds1 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds2 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds3 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds4 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds5 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds6 = leds!(HSV64, LEDS_PER_CHANNEL);
+    let leds7 = leds!(HSV64, LEDS_PER_CHANNEL);
 
     let leds: [LEDs<9, HSV64>; 8] = [leds0, leds1, leds2, leds3, leds4, leds5, leds6, leds7];
 
-    // dma.ch0
-    //     .ch()
-    //     .ch_al1_ctrl
-    //     .write(|w| unsafe { w.ring_size().bits(4) });
+    let bufs = (
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+        dma_buf!(),
+    );
+
+    leds[0].fill(bufs.0);
+    leds[1].fill(bufs.1);
+    leds[2].fill(bufs.2);
+    leds[3].fill(bufs.3);
+    leds[4].fill(bufs.4);
+    leds[5].fill(bufs.5);
+    leds[6].fill(bufs.6);
+    leds[7].fill(bufs.7);
+
+    let mut step = 0;
+    cortex_m::interrupt::free(|cs| {
+        let _lock = Spinlock0::claim();
+        unsafe {
+            CONTROLLER = Some(new_controller(leds, step));
+        }
+    });
 
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut lights = Ws2812Direct::new(
@@ -149,19 +169,91 @@ fn main() -> ! {
             pins.gpio14.into_mode(),
             pins.gpio15.into_mode(),
         ),
-        (
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-            dma_buf!(),
-        ),
+        bufs,
         clocks.peripheral_clock.freq(),
         timer.count_down(),
     );
+
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, sys_freq);
+    let mut led_count_down = timer.count_down();
+    // Create a count_down timer for 500 milliseconds
+    led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
+    loop {
+        if led_count_down.wait().is_ok() {
+            let inc = 1;
+            step += inc;
+            info!("{:?}", step);
+            cortex_m::interrupt::free(|cs| {
+                let _lock = Spinlock0::claim();
+                let controller = unsafe { CONTROLLER.as_mut().unwrap() };
+                controller.inc_step(inc);
+            });
+            led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
+        }
+
+        // let input = sio.fifo.read();
+        // if let Some(word) = input {
+        //     delay.delay_ms(word);
+        //     led_pin.toggle().unwrap();
+        //     sio.fifo.write_blocking(CORE1_TASK_COMPLETE);
+        // };
+        // delay.delay_ms(5);
+
+        cortex_m::interrupt::free(|cs| {
+            let _lock = Spinlock0::claim();
+            let controller = unsafe { CONTROLLER.as_mut().unwrap() };
+            controller.step_hue();
+            lights.write(controller.bufs());
+        });
+
+        // leds.iter_mut().for_each(|l| {
+        //     l.channel0.iter_mut().for_each(|l| l.step_hue(step));
+        //     l.channel1.iter_mut().for_each(|l| l.step_hue(step));
+        // });
+    }
+}
+
+#[entry]
+fn main() -> ! {
+    info!("Program start");
+
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 1024 * 32;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+    }
+    info!("allocator initialized");
+    let mut pac = pac::Peripherals::take().unwrap();
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+    let mut sio = Sio::new(pac.SIO);
+
+    // External high-speed crystal on the pico board is 12Mhz
+    let external_xtal_freq_hz = XOSC_CRYSTAL_FREQ;
+    let clocks = init_clocks_and_plls(
+        external_xtal_freq_hz,
+        pac.XOSC,
+        pac.CLOCKS,
+        pac.PLL_SYS,
+        pac.PLL_USB,
+        &mut pac.RESETS,
+        &mut watchdog,
+    )
+    .ok()
+    .unwrap();
+    let sys_freq = clocks.system_clock.freq().to_Hz();
+
+    let pins = bsp::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+
+    // split the PIO state machines into individual objects, so that Ws2812 can use them.
+    // each state machine will handle two channels of LEDs
 
     let (mut spec_reset, mut spec_strobe, mut spec_out) = (
         pins.gpio16.into_push_pull_output(),
@@ -209,49 +301,38 @@ fn main() -> ! {
         USB_DEVICE = Some(usb_dev);
     }
 
-    let mut step = 10110;
-    // let mut step = 19080;
-    // let mut step = 17200;
-    // let mut step = 5900;
-    // let mut step = 8000;
-    // let mut step = 12345;
-    // let mut step = 27500;
-    let mut controller = new_controller(leds, step);
-    unsafe {
-        CONTROLLER = Some(controller);
-    }
-
     unsafe {
         // Enable the USB interrupt
         pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
     };
     let FREQ = clocks.system_clock.freq();
     let core = pac::CorePeripherals::take().unwrap();
-    // todo foo lol i'm tired
     let mut delay = Foo(cortex_m::delay::Delay::new(core.SYST, FREQ.to_Hz()));
 
     let mut led_pin = pins.led.into_push_pull_output();
 
     info!("up");
 
-    let mut poll_count_down = timer.count_down();
     let mut led_count_down = timer.count_down();
     let mut led_on = true;
     // Create a count_down timer for 500 milliseconds
     led_count_down.start(LED_BLINK_RATE_MILLIS.millis());
-    poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
     let mut times_ns: u64 = 0;
-    let mut times_count = 0;
+    let mut times_count = 0; // Start up the second core to blink the second LED
+
+    let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+    let cores = mc.cores();
+    let core1 = &mut cores[1];
+    core1
+        .spawn(unsafe { &mut CORE1_STACK.mem }, move || {
+            core1_task(sys_freq)
+        })
+        .unwrap();
+
     loop {
         let start = timer.get_counter();
-        if poll_count_down.wait().is_ok() {
-            poll_usb();
-            poll_count_down.start(USB_POLL_RATE_MILLIS.millis());
-        };
 
         if led_count_down.wait().is_ok() {
-            // info!("buf0 {:X}", buf0);
-            // info!("buf1 {:X}", buf1);
             if led_on {
                 led_pin.set_low().unwrap();
                 led_on = false;
@@ -259,17 +340,6 @@ fn main() -> ! {
                 led_pin.set_high().unwrap();
                 led_on = true;
             }
-            // for v in leds.channel0.iter() {
-            //     info!("v {:X} {:X} {:X}", v.r, v.g, v.b)
-            // }
-
-            // step += 100;
-            // info!("{:?}", step);
-            // critical_section::with(|_| unsafe {
-            //     CONTROLLER.as_mut().map(|c| {
-            //         c.inc_step(100);
-            //     })
-            // });
 
             // info!("{:?}", spectrum.decay);
             // spectrum.attenuate();
@@ -295,22 +365,6 @@ fn main() -> ! {
         //     leds0.channel0[i].g = g;
         //     leds0.channel0[i].b = b;
         // }
-
-        // for v in leds.channel0.iter_mut() {
-        //     hsv::step_hue(v, step);
-        // }
-        // controller.step_hue();
-
-        let leds = critical_section::with(|_| unsafe {
-            CONTROLLER
-                .as_mut()
-                .map(|c| {
-                    c.step_hue();
-                    c.bufs()
-                })
-                .unwrap()
-        });
-        lights = lights.write(leds);
 
         // spectrum.update(
         //     &mut adc,
@@ -509,15 +563,6 @@ mod hsv {
             //     self.h = 0
             // }
         }
-
-        pub const fn new() -> Self {
-            Self {
-                inc: true,
-                h: 0,
-                s: u16::MAX,
-                v: 128,
-            }
-        }
     }
 
     impl Default for HSV64 {
@@ -687,38 +732,7 @@ mod hsv {
     }
 }
 
-fn poll_usb() {
-    let rep = CustomBidirectionalReport {
-        input_buffer: [0u8; 32],
-        output_buffer: [0u8; 32],
-    };
-    // let mut buf = [1u8; 33];
-    // match serialize(&mut buf, &rep) {
-    //     Ok(r) => {
-    //         info!("{:?}", r);
-    //         info!("{:X}", buf);
-    //     }
-    //     Err(_) => {
-    //         error!("could not serialize")
-    //     }
-    // }
-
-    // critical_section::with(|_| unsafe {
-    //     USB_HID
-    //         .as_mut()
-    //         .map(|usb_hid| match usb_hid.push_input(&rep) {
-    //             Ok(i) => {
-    //                 // info!("sent {} bytes", i)
-    //             }
-
-    //             Err(e) => handle_usberror(e),
-    //         });
-    // })
-}
-
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
-
-static mut CONTROLLER: Option<DeviceController<9>> = None;
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.
@@ -731,37 +745,17 @@ unsafe fn USBCTRL_IRQ() {
     if usb_dev.poll(&mut [usb_hid]) {
         let r = wrapper::read_all(usb_hid);
         match r {
-            Ok(data) => {
-                let controller = CONTROLLER.as_mut().unwrap();
-                let mut resp: Vec<u8> = Vec::new();
-                match controller.handle(&data.into(), &mut resp) {
-                    Ok(_) => {
-                        wrapper::write_all(usb_hid, &mut resp).map_err(handle_usberror);
-                    }
-                    Err(e) => error!("{}", e),
+            Ok(data) => cortex_m::interrupt::free(|cs| {
+                if let Ok(mut resp) = {
+                    let _lock = Spinlock0::claim();
+                    let controller = CONTROLLER.as_mut().unwrap();
+                    controller.handle(&data.into())
+                } {
+                    wrapper::write_all(usb_hid, &mut resp).map_err(handle_usberror);
                 };
-            }
+            }),
             Err(e) => handle_usberror(e),
         }
-        // let rep = SetLEDsReport {
-        //     zone_id: 0,
-        //     led_count: 0,
-        //     start_led: 0,
-        //     led_rgb: [0u8; 32],
-        // };
-        // match usb_hid.pull_raw_report(&mut data) {
-        //     Ok(info) => {
-        //         info!("report ID {:X}", info.report_id);
-        //         info!("report type {:?}", info.report_type as u8);
-        //         info!("{:X}", data);
-        //         serde_bytes::from_str();
-        //     }
-
-        //     Err(err) => handle_usberror(err),
-        // };
-        // info!("poll returned true")
-    } else {
-        // info!("poll returned false")
     }
 
     let newState = usb_dev.state();

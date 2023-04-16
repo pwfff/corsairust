@@ -28,8 +28,9 @@ pub fn new_controller<const SIZE: usize>(
 }
 
 impl<'a, const SIZE: usize> DeviceController<SIZE> {
-    pub fn handle(&self, data_in: &Vec<u8>, data_out: &mut Vec<u8>) -> Result<()> {
-        let mut w = WriteVec::new(data_out);
+    pub fn handle(&self, data_in: &Vec<u8>) -> Result<Vec<u8>> {
+        let mut data_out = Vec::new();
+        let mut w = WriteVec::new(&mut data_out);
         let h = data_in.as_slice().read_any(DEFAULT_PROTOCOL)?;
         match h.packet_id {
             PacketId::RequestControllerCount => {
@@ -41,8 +42,10 @@ impl<'a, const SIZE: usize> DeviceController<SIZE> {
             PacketId::RequestControllerData => {
                 RequestControllerData::handle(self, h, data_in, &mut w)
             }
-            i => Err(Error::UnknownPacket(9999)),
-        }
+            _ => Err(Error::UnknownPacket(9999)),
+        }?;
+
+        Ok(data_out)
     }
 
     pub fn step_hue(&mut self) {
