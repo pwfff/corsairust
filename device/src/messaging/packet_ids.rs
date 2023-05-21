@@ -2,10 +2,7 @@ use alloc::vec::Vec;
 use enum_dispatch::enum_dispatch;
 use openrgb_data::{Header, PacketId, WriteVec};
 
-use super::{
-    packets::*,
-    Error, Result,
-};
+use super::{packets::*, Error, Result};
 // use enum_primitive_derive::Primitive;
 // use num_traits::FromPrimitive;
 
@@ -55,18 +52,17 @@ pub enum PacketIdHandler {
 
     // /// Indicate to clients that device list has updated.
     // DeviceListUpdated = 100,
+    /// Request profile list.
+    RequestProfileList,
 
-    // /// Request profile list.
-    // RequestProfileList = 150,
+    /// Save current configuration in a new profile.
+    RequestSaveProfile,
 
-    // /// Save current configuration in a new profile.
-    // RequestSaveProfile = 151,
+    /// Load a given profile.
+    RequestLoadProfile,
 
-    // /// Load a given profile.
-    // RequestLoadProfile = 152,
-
-    // /// Delete a given profile.
-    // RequestDeleteProfile = 153,
+    /// Delete a given profile.
+    RequestDeleteProfile,
 
     // /// RGBController::ResizeZone().
     // RGBControllerResizeZone = 1000,
@@ -82,7 +78,6 @@ pub enum PacketIdHandler {
 
     // /// RGBController::SetCustomMode().
     // RGBControllerSetCustomMode = 1100,
-
     /// RGBController::UpdateMode().
     RGBControllerUpdateMode,
 
@@ -104,7 +99,21 @@ impl From<PacketId> for PacketIdHandler {
                 PacketIdHandler::RequestProtocolVersion(RequestProtocolVersion::default())
             }
             PacketId::SetClientName => PacketIdHandler::SetClientName(SetClientName::default()),
-            PacketId::RGBControllerUpdateMode => PacketIdHandler::RGBControllerUpdateMode(RGBControllerUpdateMode::default()),
+            PacketId::RequestProfileList => {
+                PacketIdHandler::RequestProfileList(RequestProfileList::default())
+            }
+            PacketId::RequestSaveProfile => {
+                PacketIdHandler::RequestSaveProfile(RequestSaveProfile::default())
+            }
+            PacketId::RequestLoadProfile => {
+                PacketIdHandler::RequestLoadProfile(RequestLoadProfile::default())
+            }
+            PacketId::RequestDeleteProfile => {
+                PacketIdHandler::RequestDeleteProfile(RequestDeleteProfile::default())
+            }
+            PacketId::RGBControllerUpdateMode => {
+                PacketIdHandler::RGBControllerUpdateMode(RGBControllerUpdateMode::default())
+            }
             _ => PacketIdHandler::UnknownPacket(()),
         }
     }

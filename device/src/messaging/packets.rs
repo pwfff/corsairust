@@ -1,4 +1,5 @@
 use super::packet_ids::{Handler, PacketIdHandler};
+use alloc::{boxed::Box, collections::BTreeMap};
 use alloc::{format, string::*, vec::Vec};
 use defmt::{debug, info};
 use genio::Read;
@@ -9,13 +10,18 @@ use openrgb_data::{
 use smart_leds_trait::RGB8;
 use ws2812_pio::LEDs;
 
-use crate::hsv::{self, HSV64};
+use crate::hsv::{self, HSV64, rgb2hsv};
 
 use super::{Error, Result};
 
 pub static DEFAULT_PROTOCOL: u32 = 3;
 
 pub struct DeviceController<const SIZE: usize> {
+    data: ControllerData<SIZE>,
+    profiles: BTreeMap<String, Controller>,
+}
+
+pub struct ControllerData<const SIZE: usize> {
     leds: [LEDs<SIZE, hsv::HSV64>; 8],
     active_mode: usize,
     modes: Vec<Mode>,
@@ -72,11 +78,17 @@ pub fn new_controller<const SIZE: usize>(
         });
     }
 
+    // TODO: profile persistence...
+    let profiles = BTreeMap::new();
+
     DeviceController {
-        leds,
-        active_mode: 0,
-        modes,
-        zones,
+        data: ControllerData {
+            leds,
+            active_mode: 0,
+            modes,
+            zones,
+        },
+        profiles,
     }
 }
 
@@ -92,32 +104,38 @@ impl<'a, const SIZE: usize> DeviceController<SIZE> {
     }
 
     pub fn step_hue(&mut self) {
-        if self.active_mode == 0 {
-            for leds in self.leds.iter_mut() {
+        if self.data.active_mode == 0 {
+            for leds in self.data.leds.iter_mut() {
                 for i in 0..SIZE {
-                    leds.channel0[i].step_hue(self.modes[0].speed.unwrap_or(0));
-                    leds.channel1[i].step_hue(self.modes[0].speed.unwrap_or(0));
+                    leds.channel0[i].step_hue(self.data.modes[0].speed.unwrap_or(0));
+                    leds.channel1[i].step_hue(self.data.modes[0].speed.unwrap_or(0));
                 }
             }
         }
     }
 
     pub fn set_step(&mut self, inc: u32) {
-        self.modes[0].speed = Some(inc);
+        self.data.modes[0].speed = Some(inc);
     }
 
     pub fn inc_step(&mut self, inc: u32) {
-        self.modes[0].speed = Some(self.modes[0].speed.unwrap_or(0) + inc);
+        self.data.modes[0].speed = Some(self.data.modes[0].speed.unwrap_or(0) + inc);
     }
 
     pub fn bufs(&self) -> &[LEDs<SIZE, hsv::HSV64>; 8] {
-        &self.leds
+        &self.data.leds
     }
 
     fn controller_count(&self) -> u32 {
         1
     }
 
+    fn set_mode(&mut self, i: usize, mode: Mode) {
+        self.data.modes[i] = mode;
+    }
+}
+
+impl<const SIZE: usize> ControllerData<SIZE> {
     fn openrgb_leds(&self) -> Vec<LED> {
         let mut leds = Vec::new();
         for (i, device) in self.leds.iter().enumerate() {
@@ -157,8 +175,36 @@ impl<'a, const SIZE: usize> DeviceController<SIZE> {
         }
     }
 
-    fn set_mode(&mut self, i: usize, mode: Mode) {
-        self.modes[i] = mode;
+    fn from_controller(&mut self, c: &Controller) {
+        self.modes = c.modes.clone();
+        self.zones = c.zones.clone();
+
+        let mut leds = [
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+            LEDs::<SIZE, HSV64>::default(),
+        ];
+
+        c.leds.iter().enumerate().for_each(|(i, l)| {
+            let b = l.value as u8;
+            let g = (l.value >> 8) as u8;
+            let r = (l.value >> 16) as u8;
+
+            let mut led = &mut leds[i/16];
+            let channel_i = i % 16;
+            if channel_i < 8 {
+                led.channel0[channel_i] = HSV64::from_rgb(r, g, b);
+            } else {
+                led.channel1[channel_i-8] = HSV64::from_rgb(r, g, b);
+            }
+        });
+
+        self.leds = leds;
     }
 }
 
@@ -229,7 +275,7 @@ impl Handler for RequestControllerData {
                 // TODO: device ids i guess?
                 header.device_id,
                 PacketId::RequestControllerData,
-                controller.as_controller(),
+                controller.data.as_controller(),
             )
             .map_err(|e| e.into())
     }
@@ -288,6 +334,112 @@ impl Handler for RGBControllerUpdateMode {
         let i = stream.read_value::<i32>(DEFAULT_PROTOCOL)?;
         let mode = stream.read_value::<Mode>(DEFAULT_PROTOCOL)?;
         controller.set_mode(i as usize, mode);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RequestProfileList {}
+
+impl Handler for RequestProfileList {
+    fn handle<const SIZE: usize>(
+        &self,
+        controller: &mut DeviceController<SIZE>,
+        header: Header,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
+        info!("got request profile list");
+
+        data_out.write_packet(
+            DEFAULT_PROTOCOL,
+            0,
+            PacketId::RequestProfileList,
+            (
+                controller.profiles.len(),
+                controller
+                    .profiles
+                    .keys()
+                    .into_iter()
+                    .collect::<Vec<&String>>(),
+            ),
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RequestSaveProfile {}
+
+impl Handler for RequestSaveProfile {
+    fn handle<const SIZE: usize>(
+        &self,
+        controller: &mut DeviceController<SIZE>,
+        header: Header,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
+        info!("got save profile {:X}", data_in.as_slice());
+
+        let mut stream = data_in.as_slice();
+
+        let name = stream.read_value::<String>(DEFAULT_PROTOCOL)?;
+
+        controller.profiles.insert(name, controller.data.as_controller());
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RequestLoadProfile {}
+
+impl Handler for RequestLoadProfile {
+    fn handle<const SIZE: usize>(
+        &self,
+        controller: &mut DeviceController<SIZE>,
+        header: Header,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
+        info!("got save profile {:X}", data_in.as_slice());
+
+        let mut stream = data_in.as_slice();
+
+        let name = stream.read_value::<String>(DEFAULT_PROTOCOL)?;
+
+        let entry = controller
+            .profiles
+            .get(&name)
+            .ok_or(Error::Oops(format!("profile not found")))?;
+
+        controller.data.from_controller(entry);
+
+        Ok(())
+    }
+}
+
+
+#[derive(Default)]
+pub struct RequestDeleteProfile {}
+
+impl Handler for RequestDeleteProfile {
+    fn handle<const SIZE: usize>(
+        &self,
+        controller: &mut DeviceController<SIZE>,
+        header: Header,
+        data_in: &Vec<u8>,
+        data_out: &mut WriteVec,
+    ) -> Result<()> {
+        info!("got save profile {:X}", data_in.as_slice());
+
+        let mut stream = data_in.as_slice();
+
+        let name = stream.read_value::<String>(DEFAULT_PROTOCOL)?;
+
+        controller.profiles.remove(&name);
+
         Ok(())
     }
 }

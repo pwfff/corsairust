@@ -122,7 +122,7 @@ async fn handle(dev: Arc<Mutex<Device>>, mut sock: TcpStream) -> Result<()> {
             let lock = dev.lock().await.open()?;
             lock.write(&encoded)?;
 
-            if id == PacketId::SetClientName || id == PacketId::RGBControllerUpdateMode {
+            if !id.expect_response() {
                 println!("bailing because no expected response");
                 // TODO: all the other packets without responses...
                 continue;

@@ -543,6 +543,15 @@ mod hsv {
     }
 
     impl HSV64 {
+        pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+            let (h, s, v) = rgb2hsv(r, g, b);
+            Self {
+                inc: false,
+                h,
+                s,
+                v,
+            }
+        }
         pub fn step_hue(&mut self, step: u32) {
             if self.inc {
                 self.h += step;
