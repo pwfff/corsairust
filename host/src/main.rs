@@ -7,12 +7,11 @@ use futures::executor::block_on;
 use genio::Read;
 use hidapi::HidDevice;
 use openrgb::{
-    data::OpenRGBReadable, data::OpenRGBWritable, OpenRGBReadableStream, OpenRGBStream,
-    OpenRGBWritableStream, DEFAULT_PROTOCOL,
+    data::OpenRGBReadable, data::OpenRGBWritable, data::PacketId, OpenRGBReadableStream,
+    OpenRGBStream, OpenRGBWritableStream, DEFAULT_PROTOCOL,
 };
 use openrgb_data::{
     Controller, Header, OpenRGBError, OpenRGBReadableSync, OpenRGBSync, OpenRGBWritableSync,
-    PacketId,
 };
 use std::{pin::Pin, sync::Arc};
 use tokio::{
@@ -63,7 +62,7 @@ async fn main() -> io::Result<()> {
 
     let api = hidapi::HidApi::new().unwrap();
 
-    let w = Arc::new(Mutex::new(DevWriter {
+    let w = Arc::new(Mutex::new(Device {
         api,
         address: (VID, PID),
     }));
@@ -97,13 +96,14 @@ async fn main() -> io::Result<()> {
     }
 }
 
-async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
+async fn handle(dev: Arc<Mutex<Device>>, mut sock: TcpStream) -> Result<()> {
     loop {
         println!("looking for packet");
         let header = sock
             .read_any(DEFAULT_PROTOCOL)
             .await
             .map_err(|e| format!("{:X?}", e))?;
+        let id = header.packet_id.clone();
         println!("got header {:X?}", header);
         let mut buf = vec![0; header.len as usize];
         sock.read_exact(&mut buf).await?;
@@ -114,18 +114,25 @@ async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
         header.write(&mut packet, DEFAULT_PROTOCOL).await?;
         buf.write(&mut packet, DEFAULT_PROTOCOL).await?;
 
-        println!("forwarding {:X?}", packet);
+        println!("forwarding to device {:X?}", packet);
 
         let encoded = cobs::encode_vec(&packet);
 
         let mut from_device = {
-            let lock = dev.lock().await;
+            let lock = dev.lock().await.open()?;
             lock.write(&encoded)?;
 
+            if id == PacketId::SetClientName || id == PacketId::RGBControllerUpdateMode {
+                println!("bailing because no expected response");
+                // TODO: all the other packets without responses...
+                continue;
+            }
+
             let mut from_device = Vec::<u8>::new();
+            println!("trying to read from device");
             loop {
-                let (got, gotted) = lock.read()?;
-                println!("cobbed {}: {:X?}", got, gotted);
+                let mut gotted = [0; 32];
+                let got = lock.read(&mut gotted)?;
                 if got > 0 {
                     from_device.append(&mut gotted.to_vec());
                     if gotted.iter().any(|b| *b == 0) {
@@ -147,7 +154,7 @@ async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
         println!("header from device: {:X?}", header);
         let len = header.len as usize;
         println!(
-            "forwarding response {}: {:X?} {:X?}",
+            "forwarding response to client {}: {:X?} {:X?}",
             len,
             header,
             &from_device[..16 + len]
@@ -157,27 +164,15 @@ async fn handle(dev: Arc<Mutex<DevWriter>>, mut sock: TcpStream) -> Result<()> {
     }
 }
 
-struct DevWriter {
+struct Device {
     api: hidapi::HidApi,
     address: (u16, u16),
 }
 
-impl DevWriter {
+impl Device {
     fn open(&self) -> Result<HidDevice> {
         self.api
             .open(self.address.0, self.address.1)
             .chain_err(|| "could not open device")
-    }
-
-    fn write(&self, buf: &[u8]) -> Result<usize> {
-        self.open()?
-            .write(&buf)
-            .chain_err(|| "error writing to device")
-    }
-
-    fn read(&self) -> Result<(usize, Box<[u8]>)> {
-        let mut buf = [0u8; 32];
-        let read = self.open()?.read(&mut buf)?;
-        Ok((read, Box::new(buf)))
     }
 }

@@ -30,6 +30,7 @@ ws2812-pio = { path = "/home/pwf/src/ws2812-pio-rs", default-features = false }
 byteorder = { version = "1.4.3", default-features = false }
 embedded-alloc = "0.5.0"
 smart-leds-trait = "0.2.1"
+enum_dispatch = "0.3.11"
 
 [dependencies.genio]
 git = "https://github.com/Kixunil/genio"

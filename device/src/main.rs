@@ -5,6 +5,7 @@
 #![no_main]
 mod messaging;
 
+#[macro_use]
 extern crate alloc;
 
 use alloc::vec::{self, Vec};
@@ -12,6 +13,7 @@ use bsp::hal::adc;
 use bsp::hal::dma::{DMAExt, SingleChannel, CH0, CH1};
 use bsp::hal::multicore::{Multicore, Stack};
 use bsp::hal::sio::Spinlock0;
+use cobs::decode_in_place;
 use core::cell::{RefCell, RefMut};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::AtomicPtr;
@@ -27,7 +29,7 @@ static HEAP: Heap = Heap::empty();
 
 use crate::hsv::HSV64;
 use crate::messaging::packets::*;
-use messaging::wrapper::{self, MAX_MESSAGE_SIZE};
+use messaging::wrapper::{self};
 
 use hid::*;
 
@@ -284,7 +286,7 @@ fn main() -> ! {
     let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
 
     // Set up the USB HID Class Device driver
-    let usb_hid = HIDClass::new(bus_ref, CustomBidirectionalReport::desc(), 255);
+    let usb_hid = HIDClass::new(bus_ref, CustomBidirectionalReport::desc(), 5);
     unsafe {
         // Note (safety): This is safe as interrupts haven't been started yet.
         USB_HID = Some(usb_hid);
@@ -734,6 +736,8 @@ mod hsv {
 }
 
 static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
+static mut MESSAGE_BUFFER: Vec<u8> = Vec::new();
+static mut MESSAGE_PENDING: bool = false;
 
 /// This function is called whenever the USB Hardware generates an Interrupt
 /// Request.
@@ -742,22 +746,96 @@ static mut LAST_STATE: UsbDeviceState = UsbDeviceState::Default;
 unsafe fn USBCTRL_IRQ() {
     // Handle USB request
     let usb_dev = USB_DEVICE.as_mut().unwrap();
+
     let usb_hid = USB_HID.as_mut().unwrap();
     if usb_dev.poll(&mut [usb_hid]) {
-        let r = wrapper::read_all(usb_hid);
-        match r {
-            Ok(data) => cortex_m::interrupt::free(|cs| {
-                if let Ok(mut resp) = {
-                    let _lock = Spinlock0::claim();
-                    let controller = CONTROLLER.as_mut().unwrap();
-                    controller.handle(&data.into())
-                } {
-                    wrapper::write_all(usb_hid, &mut resp).map_err(handle_usberror);
-                };
-            }),
-            Err(e) => handle_usberror(e),
+        let mut buf = [0u8; 64];
+        match usb_hid.pull_raw_output(&mut buf) {
+            Ok(i) => {
+                info!("raw output size {}", i);
+                info!("{:X}", buf);
+                if i == 0 {
+                    MESSAGE_PENDING = false;
+                    debug!("done because 0 len message");
+                } else if buf.iter().any(|b| *b == 0) {
+                    MESSAGE_PENDING = false;
+                    debug!("done because found 0");
+                } else {
+                    MESSAGE_PENDING = true;
+                }
+
+                if i > 0 {
+                    MESSAGE_BUFFER.extend(buf[0..i].iter());
+                }
+            }
+            Err(e) => {
+                handle_usberror(e);
+                MESSAGE_PENDING = false;
+            }
         }
     }
+
+    if !MESSAGE_PENDING && !MESSAGE_BUFFER.is_empty() {
+        info!("pre decode {:X}", MESSAGE_BUFFER.as_slice());
+        if let Ok(i) =
+            decode_in_place(MESSAGE_BUFFER.as_mut_slice()).map_err(|_| UsbError::ParseError)
+        {
+            MESSAGE_BUFFER.truncate(i);
+
+            info!("post decode {} {:X}", i, MESSAGE_BUFFER.as_slice());
+
+            let usb_hid = USB_HID.as_mut().unwrap();
+            cortex_m::interrupt::free(|cs| {
+                let mut resp = {
+                    let _lock = Spinlock0::claim();
+                    let controller = CONTROLLER.as_mut().unwrap();
+                    controller.handle(&mut MESSAGE_BUFFER).map_or_else(
+                        |e| {
+                            info!("{:?}", e);
+                            let mut errvec = Vec::new();
+                            errvec.push(0);
+                            errvec
+                        },
+                        |v| v,
+                    )
+                };
+                match wrapper::write_all(usb_hid, &mut resp) {
+                    Err(e) => handle_usberror(e),
+                    _ => {}
+                };
+            });
+        } else {
+            debug!("unable to cobs decode message");
+        }
+
+        MESSAGE_PENDING = false;
+        MESSAGE_BUFFER.clear();
+    }
+    // if usb_dev.poll(&mut [usb_hid]) {
+    //     let r = cortex_m::interrupt::free(|cs| wrapper::read_all(usb_hid));
+    //     match r {
+    //         Ok(data) => cortex_m::interrupt::free(|cs| {
+    //             let mut resp = {
+    //                 let _lock = Spinlock0::claim();
+    //                 let controller = CONTROLLER.as_mut().unwrap();
+    //                 controller.handle(&mut data.into()).map_or_else(
+    //                     |e| {
+    //                         info!("{:?}", e);
+    //                         let mut errvec = Vec::new();
+    //                         errvec.push(0);
+    //                         errvec
+    //                     },
+    //                     |v| v,
+    //                 )
+    //             };
+    //             match wrapper::write_all(usb_hid, &mut resp) {
+    //                 Err(e) => handle_usberror(e),
+    //                 _ => {}
+    //             };
+    //         }),
+    //         Err(e) => handle_usberror(e),
+    //     }
+    // }
 
     let newState = usb_dev.state();
     if newState != LAST_STATE {
